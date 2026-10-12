@@ -1,0 +1,343 @@
+From 0e6847eeb3bff365bb5e44754eed17388cb1f7ee Mon Sep 17 00:00:00 2001
+From: Milad <mmaziesf@uwaterloo.ca>
+Date: Mon, 12 Oct 2026 12:59:22 -0700
+Subject: [PATCH 2/2] Add glasses.capture: Ray-Ban Meta frames from a home
+ relay
+
+Muse can ask the gadget for the latest frame from the user's Meta Ray-Ban
+glasses. The command (CONFIG_HOMEHUB_GLASSES_CAPTURE) fetches one JPEG over
+HTTP from a relay on the home network (CONFIG_HOMEHUB_GLASSES_CAPTURE_URL,
+set per device like the SDK token) in a background task and returns it as
+base64, the same result shape as camera.capture. Enabled on the Core2 v1.1
+profile.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../devices/sdkconfig.muse-m5stack-core2-v11  |   4 +
+ esp32/main/CMakeLists.txt                     |   1 +
+ esp32/main/Kconfig.projbuild                  |  20 +++
+ esp32/main/app.c                              |  51 ++++++++
+ esp32/main/glasses_capture.c                  | 122 ++++++++++++++++++
+ esp32/main/glasses_capture.h                  |  26 ++++
+ esp32/main/noise_control.cpp                  |  12 ++
+ 7 files changed, 236 insertions(+)
+ create mode 100644 esp32/main/glasses_capture.c
+ create mode 100644 esp32/main/glasses_capture.h
+
+diff --git a/esp32/devices/sdkconfig.muse-m5stack-core2-v11 b/esp32/devices/sdkconfig.muse-m5stack-core2-v11
+index a09632d..0e0c02a 100644
+--- a/esp32/devices/sdkconfig.muse-m5stack-core2-v11
++++ b/esp32/devices/sdkconfig.muse-m5stack-core2-v11
+@@ -50,3 +50,7 @@ CONFIG_BTDM_CTRL_MODE_BTDM=n
+ # CONFIG_BSP_PMU_AXP192 is not set
+ CONFIG_BSP_PMU_AXP2101=y
+ 
++# glasses.capture: Muse can ask for the latest Ray-Ban Meta frame from the
++# glasses-bridge relay on the home network (~/Documents/core2_projects/glasses-bridge).
++# Set CONFIG_HOMEHUB_GLASSES_CAPTURE_URL per device, like the SDK token.
++CONFIG_HOMEHUB_GLASSES_CAPTURE=y
+diff --git a/esp32/main/CMakeLists.txt b/esp32/main/CMakeLists.txt
+index 907f36c..a4df3ba 100644
+--- a/esp32/main/CMakeLists.txt
++++ b/esp32/main/CMakeLists.txt
+@@ -26,6 +26,7 @@ set(GADGET_SRCS
+     "bug_report.c"
+     "ota.c"
+     "image_fetch.c"
++    "glasses_capture.c"
+     "../avatar/happy_anim.c"
+     "pixel_font.c"
+     "button.c"
+diff --git a/esp32/main/Kconfig.projbuild b/esp32/main/Kconfig.projbuild
+index 0f0b13f..837a298 100644
+--- a/esp32/main/Kconfig.projbuild
++++ b/esp32/main/Kconfig.projbuild
+@@ -315,6 +315,26 @@ menu "ESP32 Device SDK"
+             tenths of a degree Celsius. The onboard sensor reads warm from
+             board heat; -33 (-3.3 C, about -6 F) is a starting point.
+ 
++    config HOMEHUB_GLASSES_CAPTURE
++        bool "Ray-Ban Meta glasses frames from a home-network relay (glasses.capture)"
++        depends on SPIRAM
++        default n
++        help
++            Advertise glasses.capture: Muse can ask for the latest frame from
++            the user's Ray-Ban Meta glasses, fetched over HTTP from a relay on
++            the home network (glasses-bridge/pc/viewer.py) and returned as a
++            base64 JPEG.
++
++    config HOMEHUB_GLASSES_CAPTURE_URL
++        string "Glasses relay snapshot URL"
++        depends on HOMEHUB_GLASSES_CAPTURE
++        default "http://192.168.1.10:8765/snapshot.jpg"
++        help
++            HTTP URL that returns the latest glasses frame as one JPEG, or
++            503 while the glasses are not streaming. Set it per device to the
++            relay computer's address (idf.py menuconfig, or the build
++            directory's sdkconfig), as with the SDK token.
++
+     config HOMEHUB_DISPLAY_COMMANDS
+         bool
+         default y if HOMEHUB_DISPLAY
+diff --git a/esp32/main/app.c b/esp32/main/app.c
+index b1dcfa5..c23a323 100644
+--- a/esp32/main/app.c
++++ b/esp32/main/app.c
+@@ -33,6 +33,10 @@
+ #if CONFIG_MUSE_WATCHER_CAMERA
+ #include "freertos/idf_additions.h"
+ #endif
++#if CONFIG_HOMEHUB_GLASSES_CAPTURE
++#include "freertos/idf_additions.h"
++#include "glasses_capture.h"
++#endif
+ #include "esp_timer.h"
+ #include "esp_system.h"
+ #include "esp_attr.h"
+@@ -1559,6 +1563,37 @@ static void draw_url_done(const image_fetch_result_t *r, void *user) {
+ }
+ #endif
+ 
++#if CONFIG_HOMEHUB_GLASSES_CAPTURE
++typedef struct {
++    noise_ctrl_session_generation_t session_generation;
++    char request_id[64];
++} glasses_capture_task_args_t;
++
++static void glasses_capture_task(void *arg) {
++    glasses_capture_task_args_t *args = arg;
++    char *image = NULL;
++    const char *error = NULL;
++    cJSON *result = cJSON_CreateObject();
++    bool ok = glasses_capture(&image, &error);
++    cJSON_AddBoolToObject(result, "ok", ok);
++    if (ok) {
++        cJSON *payload = cJSON_AddObjectToObject(result, "payload");
++        cJSON_AddStringToObject(payload, "format", "jpeg-base64");
++        cJSON_AddStringToObject(payload, "source", "meta-ray-ban-glasses");
++        cJSON_AddStringToObject(payload, "data_base64", image);
++    } else {
++        cJSON *failure = cJSON_AddObjectToObject(result, "error");
++        cJSON_AddStringToObject(failure, "code", "glasses_capture_failed");
++        cJSON_AddStringToObject(failure, "message", error ? error : "glasses capture failed");
++    }
++    free(image);
++    noise_ctrl_send_command_result(args->session_generation, args->request_id, result);
++    free(args);
++    stack_monitor_record(NULL);
++    vTaskDeleteWithCaps(NULL);
++}
++#endif
++
+ #if CONFIG_MUSE_WATCHER_CAMERA
+ typedef struct {
+     noise_ctrl_session_generation_t session_generation;
+@@ -1879,6 +1914,22 @@ static cJSON *on_ws_command(
+         return result;
+     }
+ #endif
++#if CONFIG_HOMEHUB_GLASSES_CAPTURE
++    if (strcmp(command, "glasses.capture") == 0) {
++        glasses_capture_task_args_t *args = calloc(1, sizeof(*args));
++        if (!args) return command_error("out_of_memory", "failed to allocate glasses request");
++        args->session_generation = session_generation;
++        strncpy(args->request_id, request_id, sizeof(args->request_id) - 1);
++        if (xTaskCreateWithCaps(glasses_capture_task, "glasses_capture", 8192,
++                                args, 4, NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
++            free(args);
++            return command_error("out_of_memory", "failed to start glasses capture");
++        }
++        cJSON *async = cJSON_CreateObject();
++        cJSON_AddBoolToObject(async, "_async", true);
++        return async;
++    }
++#endif
+ #if CONFIG_MUSE_WATCHER_CAMERA
+     if (strcmp(command, "camera.capture") == 0) {
+         watcher_camera_task_args_t *args = calloc(1, sizeof(*args));
+diff --git a/esp32/main/glasses_capture.c b/esp32/main/glasses_capture.c
+new file mode 100644
+index 0000000..d83591f
+--- /dev/null
++++ b/esp32/main/glasses_capture.c
+@@ -0,0 +1,122 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "glasses_capture.h"
++
++#include <stdint.h>
++#include <stdlib.h>
++
++#include "esp_heap_caps.h"
++#include "esp_http_client.h"
++#include "esp_log.h"
++#include "mbedtls/base64.h"
++#include "sdkconfig.h"
++
++static const char *TAG = "link.glasses";
++
++/* The relay sends frames of ~640 px on the long side (tens of KB); refuse
++ * anything that would not be a reasonable single camera frame. */
++#define GLASSES_MAX_JPEG (512 * 1024)
++
++static void *psram_alloc(size_t len)
++{
++    void *p = heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++    return p ? p : malloc(len);
++}
++
++/* Reads the whole body; *len is the byte count. Returns NULL with *error set. */
++static uint8_t *fetch(size_t *len, const char **error)
++{
++    esp_http_client_config_t cfg = {
++        .url = CONFIG_HOMEHUB_GLASSES_CAPTURE_URL,
++        .timeout_ms = 8000,
++        .buffer_size = 4096,
++    };
++    esp_http_client_handle_t client = esp_http_client_init(&cfg);
++    if (!client) {
++        *error = "could not start the HTTP client";
++        return NULL;
++    }
++    uint8_t *body = NULL;
++    size_t got = 0;
++    int64_t content_length = 0;
++    int status = 0;
++    if (esp_http_client_open(client, 0) != ESP_OK) {
++        *error = "glasses relay is not reachable on the home network";
++        goto done;
++    }
++    content_length = esp_http_client_fetch_headers(client);
++    status = esp_http_client_get_status_code(client);
++    if (status == 404 || status == 503) {
++        *error = "no recent frame: the glasses are not streaming";
++        goto done;
++    }
++    if (status != 200) {
++        *error = "glasses relay returned an error";
++        goto done;
++    }
++    if (content_length <= 0 || content_length > GLASSES_MAX_JPEG) {
++        *error = "glasses relay sent no usable frame size";
++        goto done;
++    }
++    body = psram_alloc((size_t)content_length);
++    if (!body) {
++        *error = "out of memory for the glasses frame";
++        goto done;
++    }
++    while (got < (size_t)content_length) {
++        int n = esp_http_client_read(client, (char *)body + got, (int)((size_t)content_length - got));
++        if (n <= 0) break;
++        got += (size_t)n;
++    }
++    if (got != (size_t)content_length || got < 4 || body[0] != 0xff || body[1] != 0xd8) {
++        *error = "glasses relay sent a truncated or non-JPEG frame";
++        free(body);
++        body = NULL;
++        goto done;
++    }
++    *len = got;
++done:
++    esp_http_client_close(client);
++    esp_http_client_cleanup(client);
++    return body;
++}
++
++bool glasses_capture(char **jpeg_base64, const char **error)
++{
++    *jpeg_base64 = NULL;
++    *error = NULL;
++    size_t len = 0;
++    uint8_t *jpeg = fetch(&len, error);
++    if (!jpeg) {
++        ESP_LOGW(TAG, "capture failed: %s", *error);
++        return false;
++    }
++    size_t need = 0;
++    mbedtls_base64_encode(NULL, 0, &need, jpeg, len);
++    char *out = psram_alloc(need + 1);
++    size_t olen = 0;
++    if (!out || mbedtls_base64_encode((unsigned char *)out, need + 1, &olen, jpeg, len) != 0) {
++        free(out);
++        free(jpeg);
++        *error = "out of memory encoding the glasses frame";
++        return false;
++    }
++    out[olen] = '\0';
++    free(jpeg);
++    ESP_LOGI(TAG, "captured %u-byte frame", (unsigned)len);
++    *jpeg_base64 = out;
++    return true;
++}
+diff --git a/esp32/main/glasses_capture.h b/esp32/main/glasses_capture.h
+new file mode 100644
+index 0000000..0b05bd7
+--- /dev/null
++++ b/esp32/main/glasses_capture.h
+@@ -0,0 +1,26 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#pragma once
++
++#include <stdbool.h>
++
++/*
++ * Fetches the latest Ray-Ban Meta glasses frame from a relay on the home
++ * network (CONFIG_HOMEHUB_GLASSES_CAPTURE_URL, an HTTP GET returning one JPEG)
++ * for the glasses.capture command. On success *jpeg_base64 is a heap string
++ * the caller frees; on failure *error is a static message.
++ */
++bool glasses_capture(char **jpeg_base64, const char **error);
+diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
+index b18b304..6d6a3cc 100644
+--- a/esp32/main/noise_control.cpp
++++ b/esp32/main/noise_control.cpp
+@@ -1406,6 +1406,18 @@ static char *build_register_json(void) {
+                 nullptr, nullptr);
+ #endif
+ 
++#if CONFIG_HOMEHUB_GLASSES_CAPTURE
++    add_command(commands, "glasses.capture",
++                "Capture the latest frame from the user's Meta Ray-Ban glasses "
++                "camera: what the user is looking at right now. Use it when the "
++                "user asks about what they see, are looking at, reading, holding "
++                "or eating. Returns one JPEG as base64; fails if the glasses are "
++                "not streaming.",
++                nullptr, nullptr);
++    cJSON_AddNumberToObject(
++        cJSON_GetObjectItem(commands, "glasses.capture"), "timeout_ms", 15000);
++#endif
++
+ #if CONFIG_MUSE_WATCHER_CAMERA
+     add_command(commands, "camera.capture",
+                 "Capture one still JPEG frame from the SenseCAP Watcher camera. "
+-- 
+2.53.0
+

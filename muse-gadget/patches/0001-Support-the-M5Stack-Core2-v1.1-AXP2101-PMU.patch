@@ -1,0 +1,482 @@
+From 0fb388239b1af590d12aae1a9e34f79c1c576edc Mon Sep 17 00:00:00 2001
+From: Milad <mmaziesf@uwaterloo.ca>
+Date: Mon, 12 Oct 2026 12:56:21 -0700
+Subject: [PATCH 1/2] Support the M5Stack Core2 v1.1 (AXP2101 PMU)
+
+The Core2 v1.1 replaces the v1.0's AXP192 with an AXP2101 at the same I2C
+address but a different register map, so the v1.0 build must not run on it.
+Espressif's m5stack_core_2 BSP already handles the v1.1 rails and backlight
+(BSP_PMU_AXP2101); this adds AXP2101 branches for the board file's own PMU
+access, taken from M5Unified's AXP2101 driver and Core2 v1.1 setup:
+
+- PEK events from IRQ status 1 (0x49, bits 3/2), cleared by write-back
+- battery voltage from 0x34-0x35 (14-bit, 1 mV), charge state from 0x01,
+  VBUS and battery presence from 0x00, ADCs on via 0x30
+- backlight on/off through the BSP (BLDO1), power off via 0x10 bit 0
+
+New build profile core2v11 (devices/sdkconfig.muse-m5stack-core2-v11) in
+board.sh, ports.py and avatar.py; the board reports "M5Stack Core2 v1.1" so
+avatar.py rebuilds the right profile. The Core2 button test now runs its
+scenarios against both PMUs' PEK layouts. Tested on a Core2 v1.1: boots,
+display and backlight work, pairs and talks to Muse.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../muse/boards/board_m5stack_core2.c         | 98 +++++++++++++++----
+ .../devices/sdkconfig.muse-m5stack-core2-v11  | 52 ++++++++++
+ esp32/tests/test_core2_buttons.py             | 35 +++++--
+ esp32/tools/muse/avatar.py                    |  3 +-
+ esp32/tools/muse/board.sh                     |  6 +-
+ esp32/tools/muse/ports.py                     |  3 +-
+ 6 files changed, 168 insertions(+), 29 deletions(-)
+ create mode 100644 esp32/devices/sdkconfig.muse-m5stack-core2-v11
+
+diff --git a/esp32/components/muse/boards/board_m5stack_core2.c b/esp32/components/muse/boards/board_m5stack_core2.c
+index 18d5ec2..efc417d 100644
+--- a/esp32/components/muse/boards/board_m5stack_core2.c
++++ b/esp32/components/muse/boards/board_m5stack_core2.c
+@@ -33,15 +33,18 @@
+  * port clocks, so one direction is configured at a time. Push-to-talk is
+  * half-duplex anyway (record, then play).
+  *
+- * Core2 v1.1 units use the AXP2101 PMU and are not supported: the PEK,
+- * battery, backlight and shutdown code below is specific to the AXP192.
++ * Core2 v1.1 units use the AXP2101 PMU instead (CONFIG_BSP_PMU_AXP2101, set by
++ * devices/sdkconfig.muse-m5stack-core2-v11). Both chips sit at 0x34 with
++ * different register maps, so every direct PMU access below has an AXP2101
++ * branch, taken from M5Unified's AXP2101_Class and its Core2 v1.1 setup; the
++ * BSP does the v1.1 rail setup and backlight itself.
+  */
+ #include <math.h>
+ 
+ #include "sdkconfig.h"
+ 
+-#if !CONFIG_BSP_PMU_AXP192
+-#error "The Muse Core2 port requires the Core2 v1.0 AXP192 PMU"
++#if !CONFIG_BSP_PMU_AXP192 && !CONFIG_BSP_PMU_AXP2101
++#error "The Muse Core2 port needs the AXP192 (Core2 v1.0) or AXP2101 (Core2 v1.1) PMU"
+ #endif
+ 
+ #include "bsp/esp-bsp.h"
+@@ -65,8 +68,16 @@ static const char *TAG = "board";
+ #define DRAW_BUF_LINES 10       /* 320x10 px double-buffered, in internal RAM:
+                                  * the classic ESP32's SPI DMA can't reach PSRAM */
+ #define AXP_ADDR 0x34
++#if CONFIG_BSP_PMU_AXP2101
++#define AXP_PEK_STATUS 0x49    /* IRQ status 1, bit 3: short press, bit 2: long press; write to clear */
++#define AXP_PEK_MASK 0x0c
++#define AXP_PEK_SHIFT 2        /* -> short = 2, long = 1, as on the AXP192 */
++#else
+ #define AXP_PEK_STATUS 0x46    /* bit 1: short press, bit 0: long press; write to clear */
++#define AXP_PEK_MASK 0x03
++#define AXP_PEK_SHIFT 0
+ #define AXP_BATT_MV_LSB 1.1f   /* 12-bit battery ADC: 1.1 mV per step */
++#endif
+ 
+ #define MIC_CLK GPIO_NUM_0
+ #define MIC_DATA GPIO_NUM_34
+@@ -89,7 +100,7 @@ static esp_err_t axp_read(uint8_t reg, uint8_t *buf, size_t len)
+     return i2c_master_transmit_receive(s_axp, &reg, 1, buf, len, 1000);
+ }
+ 
+-/* Read-modify-write one AXP192 register, setting the mask bits to value. */
++/* Read-modify-write one PMU register, setting the mask bits to value. */
+ static esp_err_t axp_write_masked(uint8_t reg, uint8_t mask, uint8_t value)
+ {
+     uint8_t cur;
+@@ -100,8 +111,8 @@ static esp_err_t axp_write_masked(uint8_t reg, uint8_t mask, uint8_t value)
+ 
+ /*
+  * PEK key events, not the physical held state. The bits latch,
+- * so a nonzero read is written back to clear it, as M5Unified's AXP192 driver
+- * does. Returns the key bits (short = 2, long = 1), or -1 on error.
++ * so a nonzero read is written back to clear it, as M5Unified's AXP192 and
++ * AXP2101 drivers do. Returns the key bits (short = 2, long = 1), or -1 on error.
+  */
+ static int pek_read(void)
+ {
+@@ -109,14 +120,14 @@ static int pek_read(void)
+     if (axp_read(AXP_PEK_STATUS, &val, 1) != ESP_OK) {
+         return -1;
+     }
+-    val &= 0x03;
++    val &= AXP_PEK_MASK;
+     if (val) {
+         uint8_t clear[2] = { AXP_PEK_STATUS, val };
+         if (i2c_master_transmit(s_axp, clear, sizeof(clear), 1000) != ESP_OK) {
+             return -1;
+         }
+     }
+-    return val;
++    return val >> AXP_PEK_SHIFT;
+ }
+ 
+ /*
+@@ -159,14 +170,24 @@ static esp_err_t init(void)
+     };
+     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bsp_i2c_get_handle(), &tp_cfg, &s_tp), TAG,
+                         "touch init");
++#if CONFIG_BSP_PMU_AXP2101
++    /* Battery, TS, VBUS and VSYS ADCs on (reg 0x30), as M5Unified's Core2 v1.1
++     * setup does. The AXP2101 latches PEK events in its IRQ status register
++     * without the IRQ being enabled, so only clear the power-on press. */
++    const uint8_t adc_on[2] = { 0x30, 0x0f };
++    ESP_RETURN_ON_ERROR(i2c_master_transmit(s_axp, adc_on, sizeof(adc_on), 1000), TAG,
++                        "axp adc on");
++#else
+     /* Battery ADC on: the BSP's display init does this too, but power reads
+      * must work even if the display never starts. */
+     const uint8_t adc_on[2] = { 0x82, 0xff };
+     ESP_RETURN_ON_ERROR(i2c_master_transmit(s_axp, adc_on, sizeof(adc_on), 1000), TAG,
+                         "axp adc on");
+-    /* Enable both PEK event sources, as M5Unified does. Clear any event left
+-     * by the power-on press; an event bit cannot tell us whether PWR is held. */
++    /* Enable both PEK event sources, as M5Unified does. */
+     ESP_RETURN_ON_ERROR(axp_write_masked(0x42, 0x03, 0x03), TAG, "axp pek enable");
++#endif
++    /* Clear any event left by the power-on press; an event bit cannot tell us
++     * whether PWR is held. */
+     ESP_RETURN_ON_ERROR(pek_read() < 0 ? ESP_FAIL : ESP_OK, TAG, "axp pek clear");
+     /* A finger resting on the screen through boot counts as already down too.
+      * The touch controller may still be unpowered here; a failed read just
+@@ -228,6 +249,12 @@ static bool display_lock(int timeout_ms)
+ 
+ static void set_brightness(int pct)
+ {
++#if CONFIG_BSP_PMU_AXP2101
++    /* The BSP cuts the v1.1 backlight rail (BLDO1) at 0% and restores it above. */
++    if (bsp_display_brightness_set(pct < 0 ? 0 : pct) != ESP_OK) {
++        ESP_LOGW(TAG, "backlight set failed");
++    }
++#else
+     if (pct <= 0) {
+         /* The BSP only turns the backlight rail down, never off: cut DCDC3
+          * (the backlight rail; LCD logic is LDO2) explicitly. */
+@@ -239,6 +266,7 @@ static void set_brightness(int pct)
+     if (bsp_display_brightness_set(pct) != ESP_OK) {
+         ESP_LOGW(TAG, "backlight set failed");
+     }
++#endif
+ }
+ 
+ /*
+@@ -408,7 +436,7 @@ static int spk_write(const audio_codec_data_if_t *h, uint8_t *data, int size)
+ 
+ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t *mic)
+ {
+-    /* Power the amp: AXP192 GPIO2, through the BSP's rail setup. I2S channels
++    /* Power the amp (AXP192 GPIO2 on v1.0, AXP2101 ALDO3 on v1.1) through the BSP's rail setup. I2S channels
+      * are created lazily by use_mic()/use_speaker(), one direction at a time. */
+     ESP_RETURN_ON_ERROR(bsp_feature_enable(BSP_FEATURE_SPEAKER, true), TAG, "speaker rail");
+ 
+@@ -421,7 +449,7 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t
+     return *spk && *mic ? ESP_OK : ESP_FAIL;
+ }
+ 
+-/* BtnB reports real held edges. The AXP192 reports completed short/long
++/* BtnB reports real held edges. The PMU reports completed short/long
+  * presses instead: a short press is an aux click, and a long press requests
+  * shutdown directly, before the PMU's ~4 s hardware cut. */
+ static unsigned poll_buttons(void)
+@@ -448,6 +476,34 @@ static unsigned poll_buttons(void)
+     return out;
+ }
+ 
++/* The Watcher's LiPo curve, as on the other M5Stack boards. */
++static int battery_pct_from_mv(int v)
++{
++    int pct = (-v * v + 9016 * v - 19189000) / 10000;
++    return pct < 0 ? 0 : pct > 100 ? 100 : pct;
++}
++
++#if CONFIG_BSP_PMU_AXP2101
++/* Battery voltage (14-bit ADC, 1 mV steps, regs 0x34-0x35), charger and USB state. */
++static esp_err_t read_power(muse_power_t *out)
++{
++    uint8_t r00, r01, batt[2];
++    ESP_RETURN_ON_ERROR(axp_read(0x00, &r00, 1), TAG, "axp status");
++    ESP_RETURN_ON_ERROR(axp_read(0x01, &r01, 1), TAG, "axp charge status");
++    ESP_RETURN_ON_ERROR(axp_read(0x34, batt, sizeof(batt)), TAG, "axp battery");
++    out->usb = (r00 & 0x20) != 0;                    /* VBUS good */
++    out->charging = ((r01 >> 5) & 0x03) == 0x01;     /* 01 charge, 10 discharge, 00 standby */
++    if ((r00 & 0x08) == 0) {                         /* no battery */
++        out->battery_mv = 0;
++        out->battery_pct = -1;
++        return ESP_OK;
++    }
++    int v = ((batt[0] & 0x3f) << 8) | batt[1];
++    out->battery_mv = v;
++    out->battery_pct = v < 2500 ? -1 : battery_pct_from_mv(v);
++    return ESP_OK;
++}
++#else
+ /* Battery voltage (12-bit ADC, 1.1 mV steps), charger and USB state. */
+ static esp_err_t read_power(muse_power_t *out)
+ {
+@@ -468,25 +524,33 @@ static esp_err_t read_power(muse_power_t *out)
+         out->battery_pct = -1;
+         return ESP_OK;
+     }
+-    /* The Watcher's LiPo curve, as on the other M5Stack boards. */
+-    int pct = (-v * v + 9016 * v - 19189000) / 10000;
+-    out->battery_pct = pct < 0 ? 0 : pct > 100 ? 100 : pct;
++    out->battery_pct = battery_pct_from_mv(v);
+     return ESP_OK;
+ }
++#endif
+ 
+ /*
+- * Screen dark, then the AXP192 cuts every rail; PWR turns the board back on.
++ * Screen dark, then the PMU cuts every rail; PWR turns the board back on.
+  * The PEK event register has no physical held state to wait on.
+  */
+ static esp_err_t power_off(void)
+ {
+     set_brightness(0);
++#if CONFIG_BSP_PMU_AXP2101
++    /* PMU common config, bit 0: power off (M5Unified's AXP2101 powerOff). */
++    ESP_RETURN_ON_ERROR(axp_write_masked(0x10, 0x01, 0x01), TAG, "axp shutdown");
++#else
+     ESP_RETURN_ON_ERROR(axp_write_masked(0x32, 0x80, 0x80), TAG, "axp shutdown");
++#endif
+     return ESP_FAIL;
+ }
+ 
+ static const muse_board_t s_board = {
++#if CONFIG_BSP_PMU_AXP2101
++    .name = "M5Stack Core2 v1.1",
++#else
+     .name = "M5Stack Core2",
++#endif
+     .width = BSP_LCD_H_RES,
+     .height = BSP_LCD_V_RES,
+     .round = false,
+diff --git a/esp32/devices/sdkconfig.muse-m5stack-core2-v11 b/esp32/devices/sdkconfig.muse-m5stack-core2-v11
+new file mode 100644
+index 0000000..a09632d
+--- /dev/null
++++ b/esp32/devices/sdkconfig.muse-m5stack-core2-v11
+@@ -0,0 +1,52 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# M5Stack Core2 v1.1: same as v1.0 (below) except the PMU, an AXP2101 instead
++# of the AXP192 (BSP choice BSP_PMU_AXP2101; board_m5stack_core2.c branches on it).
++# Build with tools/muse/board.sh build core2v11.
++# v1.0 notes: ESP32-D0WDQ6-V3 (classic ESP32, 16 MB flash, 8 MB quad
++# PSRAM), 2.0" 320x240 ILI9342C touch LCD, PDM mic, I2S speaker, AXP192 PMU,
++# console on a CP2104 or CH9102F USB-UART bridge. Load last, after
++# sdkconfig.muse.
++# Sources: https://github.com/espressif/esp-bsp/tree/master/bsp/m5stack_core_2
++# (pins, AXP rail setup, panel/touch/audio init) and
++# https://github.com/m5stack/M5Unified (AXP192 registers, mic pins).
++CONFIG_IDF_TARGET="esp32"
++CONFIG_MUSE_BOARD_M5STACK_CORE2=y
++# Signed apps without Secure Boot use the Secure Boot V2 (RSA) scheme, which
++# the ESP32 supports from chip revision 3.0 (the D0WDQ6-V3 is one).
++CONFIG_ESP32_REV_MIN_3=y
++CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
++CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
++CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
++
++CONFIG_SPIRAM=y
++# CONFIG_SPIRAM_IGNORE_NOTFOUND is not set
++# Muse's voice task keeps its stack in PSRAM. Off by default on the ESP32 for
++# the revision 1 PSRAM cache bug, which revision 3 (above) doesn't have.
++CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
++CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
++CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
++CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
++
++# Release the classic Bluetooth controller memory; pairing is BLE only.
++CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
++CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=n
++CONFIG_BTDM_CTRL_MODE_BTDM=n
++
++# Core2 v1.1 PMU is the AXP2101 (v1.0's is the AXP192); the board revision is
++# printed on its back sticker or PCB.
++# CONFIG_BSP_PMU_AXP192 is not set
++CONFIG_BSP_PMU_AXP2101=y
++
+diff --git a/esp32/tests/test_core2_buttons.py b/esp32/tests/test_core2_buttons.py
+index 3a8df99..220d1e0 100644
+--- a/esp32/tests/test_core2_buttons.py
++++ b/esp32/tests/test_core2_buttons.py
+@@ -12,7 +12,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-"""Compile production Core2 input handlers against touch and PMU fakes."""
++"""Compile production Core2 input handlers against touch and PMU fakes, once
++with the Core2 v1.0 AXP192 register definitions and once with the v1.1 AXP2101 ones."""
+ import os
+ from pathlib import Path
+ import re
+@@ -36,14 +37,24 @@ def function(source, name):
+     return source[start:end]
+ 
+ 
++def pek_defines(board):
++    """The AXP_PEK_* defines of each PMU branch: {"axp2101": ..., "axp192": ...}."""
++    block = re.search(r"^#if CONFIG_BSP_PMU_AXP2101\n(.*?)^#else\n(.*?)^#endif", board, re.M | re.S)
++    branches = {"axp2101": block[1], "axp192": block[2]}
++    return {pmu: "\n".join(re.findall(r"^#define AXP_PEK_\w+ .*", text, re.M))
++            for pmu, text in branches.items()}
++
++
+ class Core2Buttons(unittest.TestCase):
++    PMU = "axp192"
++
+     @classmethod
+     def setUpClass(cls):
+         cls.tmp = tempfile.TemporaryDirectory()
+         board = (ROOT / "components/muse/boards/board_m5stack_core2.c").read_text()
+         header = (ROOT / "components/muse/muse_board.h").read_text()
+         defines = "\n".join(re.findall(r"^#define MUSE_BTN_.*", header, re.M))
+-        pek_define = re.search(r"^#define AXP_PEK_STATUS .*", board, re.M)[0]
++        pek_define = pek_defines(board)[cls.PMU]
+         source = r'''
+ #include <assert.h>
+ #include <stdbool.h>
+@@ -51,6 +62,9 @@ class Core2Buttons(unittest.TestCase):
+ #include <stdlib.h>
+ #define ESP_OK 0
+ ''' + defines + "\n" + pek_define + r'''
++/* Raw latched register bits for each event, per the PMU's layout. */
++#define PEK_SHORT (2u << AXP_PEK_SHIFT)
++#define PEK_LONG (1u << AXP_PEK_SHIFT)
+ static bool s_talk_pressed;
+ static void *s_axp;
+ static int zone, read_error, clear_error, shutdowns, clears;
+@@ -64,7 +78,7 @@ static int axp_read(uint8_t reg, uint8_t *out, size_t len) {
+ static int i2c_master_transmit(void *dev, const uint8_t *data, size_t len, int timeout) {
+     (void)dev; (void)timeout;
+     assert(len == 2 && data[0] == AXP_PEK_STATUS);
+-    assert((data[1] & ~0x03) == 0); /* Leave other IRQ sources alone. */
++    assert((data[1] & ~AXP_PEK_MASK) == 0); /* Leave other IRQ sources alone. */
+     if (clear_error) return clear_error;
+     latched &= ~data[1];
+     ++clears;
+@@ -87,14 +101,14 @@ static void fake_touch_read(lv_indev_t *indev, lv_indev_data_t *data) {
+ static void (*s_touch_read)(lv_indev_t *, lv_indev_data_t *) = fake_touch_read;
+ ''' + "\n".join(function(board, name) for name in ("pek_read", "poll_buttons", "touch_read")) + r'''
+ static void key_events(void) {
+-    latched = 2; /* AXP192 short-press event, not a held level. */
++    latched = PEK_SHORT; /* PMU short-press event, not a held level. */
+     assert(poll_buttons() == (MUSE_BTN_AUX_PRESS | MUSE_BTN_AUX_RELEASE));
+     assert(clears == 1 && shutdowns == 0);
+     assert(poll_buttons() == 0);
+-    latched = 1; /* PMU long-press event requests clean shutdown. */
++    latched = PEK_LONG; /* PMU long-press event requests clean shutdown. */
+     assert(poll_buttons() == 0 && shutdowns == 1);
+     assert(poll_buttons() == 0 && shutdowns == 1);
+-    latched = 3; /* Long press takes priority over a stale short event. */
++    latched = PEK_SHORT | PEK_LONG; /* Long press takes priority over a stale short event. */
+     assert(poll_buttons() == 0 && shutdowns == 2);
+     latched = 0x80; /* Unrelated IRQ bit is neither cleared nor a key. */
+     assert(poll_buttons() == 0 && latched == 0x80 && shutdowns == 2);
+@@ -108,11 +122,11 @@ static void touch_edges(void) {
+     zone = 0;
+     assert(poll_buttons() == MUSE_BTN_TALK_RELEASE);
+     assert(poll_buttons() == 0);
+-    zone = 1; latched = 2;
++    zone = 1; latched = PEK_SHORT;
+     assert(poll_buttons() == (MUSE_BTN_TALK_PRESS | MUSE_BTN_AUX_PRESS | MUSE_BTN_AUX_RELEASE));
+ }
+ static void pmu_errors(void) {
+-    latched = 1; read_error = -1;
++    latched = PEK_LONG; read_error = -1;
+     assert(poll_buttons() == 0 && shutdowns == 0 && clears == 0);
+     read_error = 0; clear_error = -1;
+     assert(poll_buttons() == 0 && shutdowns == 0 && clears == 0);
+@@ -173,3 +187,8 @@ int main(int argc, char **argv) {
+ 
+     def test_touch_strip_is_excluded_from_lvgl(self):
+         subprocess.run([str(self.binary), "3"], check=True)
++
++
++class Core2V11Buttons(Core2Buttons):
++    """The same scenarios with the Core2 v1.1 AXP2101's PEK register layout."""
++    PMU = "axp2101"
+diff --git a/esp32/tools/muse/avatar.py b/esp32/tools/muse/avatar.py
+index 289f1f1..7a82b8f 100644
+--- a/esp32/tools/muse/avatar.py
++++ b/esp32/tools/muse/avatar.py
+@@ -72,13 +72,14 @@ BOARDS = {
+     "M5Stack StopWatch": "stopwatch",
+     "M5Stack CoreS3": "cores3",
+     "M5Stack Core2": "core2",
++    "M5Stack Core2 v1.1": "core2v11",
+     "Freenove FNK0104B": "fnk0104b",
+     "Guition JC3248W535": "jc3248w535",
+     "Waveshare ESP32-S3-Touch-LCD-7": "lcd7",
+     "VN ESP32-S3 1.83-inch NV3023": "vn183",
+     "FoloToy AI Passport": "ai-passport",
+ }
+-CHAT_BOARDS = ("s3", "s3n", "s3-216", "aipi", "box3", "sticks3", "watcher", "stopwatch", "cores3", "core2", "fnk0104b", "jc3248w535", "lcd7", "vn183")
++CHAT_BOARDS = ("s3", "s3n", "s3-216", "aipi", "box3", "sticks3", "watcher", "stopwatch", "cores3", "core2", "core2v11", "fnk0104b", "jc3248w535", "lcd7", "vn183")
+ 
+ 
+ class Stop(Exception):
+diff --git a/esp32/tools/muse/board.sh b/esp32/tools/muse/board.sh
+index df003e0..be03c83 100755
+--- a/esp32/tools/muse/board.sh
++++ b/esp32/tools/muse/board.sh
+@@ -14,7 +14,7 @@
+ # limitations under the License.
+ 
+ # Build or flash Home Link for one board:
+-#   tools/muse/board.sh build|flash <s3|s3n|s3-216|aipi|box3|c6|c6-206|watcher|sticks3|plus2|cardputer-adv|stopwatch|cores3|core2|fnk0104b|jc3248w535|lcd7|vn183|ai-passport> [serial|port]
++#   tools/muse/board.sh build|flash <s3|s3n|s3-216|aipi|box3|c6|c6-206|watcher|sticks3|plus2|cardputer-adv|stopwatch|cores3|core2|core2v11|fnk0104b|jc3248w535|lcd7|vn183|ai-passport> [serial|port]
+ # Build log: /tmp/muse_build_<board>.log. flash finds the board's port by its
+ # USB device (tools/muse/ports.py); with several of a kind attached, pass the
+ # one's USB serial number (the MAC on native USB) or its port. Flashing from a
+@@ -23,7 +23,7 @@
+ # flashes in build-muse-<profile>-bench/, so neither build's sdkconfig hides
+ # the other's.
+ set -uo pipefail
+-cmd=${1:?build|flash}; board=${2:?s3|s3n|s3-216|aipi|box3|c6|c6-206|watcher|sticks3|plus2|cardputer-adv|stopwatch|cores3|core2|fnk0104b|jc3248w535|lcd7|vn183|ai-passport}
++cmd=${1:?build|flash}; board=${2:?s3|s3n|s3-216|aipi|box3|c6|c6-206|watcher|sticks3|plus2|cardputer-adv|stopwatch|cores3|core2|core2v11|fnk0104b|jc3248w535|lcd7|vn183|ai-passport}
+ root=$(cd "$(dirname "$0")/../.." && pwd)
+ case $board in
+     s3)      profile=waveshare-s3-175c;    target=esp32s3 ;;
+@@ -48,6 +48,8 @@ case $board in
+     plus2)   profile=m5stack-stickc-plus2; target=esp32; baud=230400 ;;
+     # The Core2's bridge is a CP2104 or a CH9102F: 230400 is safe on both.
+     core2)   profile=m5stack-core2; target=esp32; baud=230400 ;;
++    # Core2 v1.1: AXP2101 PMU instead of the v1.0's AXP192. Same bridges and baud.
++    core2v11) profile=m5stack-core2-v11; target=esp32; baud=230400 ;;
+     ai-passport) profile=ai-passport;      target=esp32c3 ;;
+     *) echo "unknown board $board"; exit 2 ;;
+ esac
+diff --git a/esp32/tools/muse/ports.py b/esp32/tools/muse/ports.py
+index 0d4b9a7..cfeea85 100755
+--- a/esp32/tools/muse/ports.py
++++ b/esp32/tools/muse/ports.py
+@@ -64,10 +64,11 @@ USB = {
+     "watcher": CH342,   # the ESP32-S3 on the second port; the Himax camera chip is on the first
+     "plus2": CH9102,
+     "core2": (CP210X, CH9102),
++    "core2v11": (CP210X, CH9102),
+ }
+ # Boards whose console takes Muse's serial commands (tools/muse/chat.py). The
+ # Watcher reads them on its CH342 port with MUSE_CONSOLE_UART.
+-COMMANDS = ("s3", "s3n", "s3-216", "aipi", "box3", "c6", "c6-206", "sticks3", "watcher", "plus2", "cardputer-adv", "stopwatch", "cores3", "core2", "fnk0104b", "jc3248w535", "lcd7", "vn183", "ai-passport")
++COMMANDS = ("s3", "s3n", "s3-216", "aipi", "box3", "c6", "c6-206", "sticks3", "watcher", "plus2", "cardputer-adv", "stopwatch", "cores3", "core2", "core2v11", "fnk0104b", "jc3248w535", "lcd7", "vn183", "ai-passport")
+ # Bridges that drop bytes when a whole packet arrives at once, so writes to them
+ # go 64 bytes at a time at the line rate (paced_esptool.py, chat.Board.write).
+ PACED = (CH342,)
+-- 
+2.53.0
+

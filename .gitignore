@@ -1,0 +1,22 @@
+# Secrets
+.env
+core2-standalone/include/secrets.h
+
+# Firmware backups (vendor firmware and per-device data)
+core2-backup/
+*.bin
+
+# Build output
+.DS_Store
+ios/.build/
+ios/.swiftpm/
+ios/.bsp/
+ios/xtool/
+ios/Package.resolved
+core2-standalone/.pio/
+__pycache__/
+
+# Data
+meal-log/
+pc/snapshots/
+pc/recordings/

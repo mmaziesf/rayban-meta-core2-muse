@@ -1,5 +1,12 @@
 # iPhone app: build on Linux with xtool
 
+The app's code lives in its own repo,
+**[mmaziesf/glasses-bridge-ios](https://github.com/mmaziesf/glasses-bridge-ios)**,
+included here as the `ios/` git submodule. Clone this repo with
+`--recursive`, or run `git submodule update --init`, and the paths below
+work as written. To change the app, commit in that repo, then commit the
+updated submodule pointer here.
+
 Glasses Bridge is a small SwiftUI app around Meta's Wearables Device Access
 Toolkit (DAT). It registers with the Meta AI app, starts a camera stream from
 the glasses, serves the latest frame to the Core2 on your Wi-Fi, and can also

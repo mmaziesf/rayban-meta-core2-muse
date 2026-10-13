@@ -28,7 +28,7 @@ cloud, transcribes you and gives Muse's replies a voice.
 
 | Path | What it is |
 |---|---|
-| [`ios/`](ios) | **Glasses Bridge** iPhone app (SwiftUI + DAT SDK 1.0.0), built **on Linux** with [xtool](https://github.com/xtool-org/xtool). Streams the glasses camera as HEVC, which keeps flowing while the phone is locked. |
+| [`ios/`](https://github.com/mmaziesf/glasses-bridge-ios) | **Glasses Bridge** iPhone app (SwiftUI + DAT SDK 1.0.0), built **on Linux** with [xtool](https://github.com/xtool-org/xtool). It serves the newest glasses frame to the Core2 over Wi-Fi (Bonjour), even with the phone locked, and can stream HEVC to a PC. It lives in its own repo, **[glasses-bridge-ios](https://github.com/mmaziesf/glasses-bridge-ios)**, included here as a git submodule. |
 | [`pc/`](pc) | **Speech server and relay** (Python, run with `uv`). `speech_server.py`: Whisper speech-to-text and Kokoro text-to-speech for the Core2. `viewer.py`: decodes and shows the stream, serves `/snapshot.jpg`, relays frames to the standalone Core2 firmware, plus an optional Muse Spark vision agent and a meal log. |
 | [`cloud/`](cloud) | A Docker image of the speech server for a cloud host, so the Core2 needs no PC. |
 | [`muse-gadget/`](muse-gadget) | **Patches for Meta's [Muse Gadget SDK](https://github.com/facebookincubator/muse-gadget-sdk)**: Core2 **v1.1** (AXP2101) support, which upstream lacks; a `glasses.capture` command so Muse can see through the glasses; an on-device wake word, spoken replies and hands-free turns; frames straight from the phone. Scripts to apply, build and flash. |
@@ -54,7 +54,8 @@ Meta AI and Muse apps, an **M5Stack Core2 v1.1**, and a Linux PC to build on.
 The phone and the Core2 must share a Wi-Fi network (2.4 GHz for the Core2).
 
 ```sh
-git clone https://github.com/<you>/rayban-meta-core2-muse && cd rayban-meta-core2-muse
+git clone --recursive https://github.com/mmaziesf/rayban-meta-core2-muse && cd rayban-meta-core2-muse
+# (already cloned without --recursive? run: git submodule update --init)
 cp .env.example .env            # fill in GADGET_SDK_TOKEN, TTS_URL, STT_URL, MODEL_API_KEY
 
 # 1. Back up the Core2 first (all 16 MB); restore any time with scripts/restore_core2.sh

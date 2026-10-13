@@ -1,22 +1,32 @@
-From 3a3aea80096b8d9761f246a4bf9cbe14821c6369 Mon Sep 17 00:00:00 2001
+From ddf5d0a9d9e24d4cc4e2b6b30f365fcacddc77dc Mon Sep 17 00:00:00 2001
 From: Milad <mmaziesf@uwaterloo.ca>
-Date: Mon, 12 Oct 2026 20:44:51 -0700
+Date: Mon, 12 Oct 2026 21:48:57 -0700
 Subject: [PATCH 4/4] glasses.capture: frames straight from the iPhone app,
  pre-armed per turn
 
-HOMEHUB_GLASSES_DISCOVER finds the Glasses Bridge app over mDNS
-(_glasses-bridge._tcp, espressif/mdns) and fetches /snapshot.jpg from the
-phone, falling back to HOMEHUB_GLASSES_CAPTURE_URL. The phone is looked up
-as soon as Wi-Fi is up, and each voice turn fetches a frame in the
-background so glasses.capture answers from memory.
+HOMEHUB_GLASSES_DISCOVER gets frames from the Glasses Bridge iPhone app
+itself, so no PC relay is needed. The app serves GET /snapshot.jpg and
+advertises _glasses-bridge._tcp; the gadget finds it with mDNS
+(espressif/mdns: PTR, then an A query when the answer carries only the
+SRV record), as soon as Wi-Fi is up, then every 30 s until found, and
+again whenever the phone stops answering. mDNS runs only during a lookup
+and is freed after it (its task and buffers are internal RAM the display
+needs). HOMEHUB_GLASSES_CAPTURE_URL becomes the fallback; leave it empty
+to use the phone only.
+
+Pre-armed capture: each voice turn (wake word, tap) starts a background
+fetch, so when Muse calls glasses.capture a few seconds later the frame of
+the moment the user asked is already in memory. A capture waits up to 3 s
+for a fetch in flight, uses a frame under 20 s old once, and otherwise
+fetches live.
 ---
  esp32/main/CMakeLists.txt    |   7 +
  esp32/main/Kconfig.projbuild |  14 +-
  esp32/main/app.c             |   3 +
- esp32/main/glasses_capture.c | 246 ++++++++++++++++++++++++++++++++++-
+ esp32/main/glasses_capture.c | 267 ++++++++++++++++++++++++++++++++++-
  esp32/main/glasses_capture.h |  20 ++-
  esp32/main/idf_component.yml |   4 +
- 6 files changed, 284 insertions(+), 10 deletions(-)
+ 6 files changed, 305 insertions(+), 10 deletions(-)
 
 diff --git a/esp32/main/CMakeLists.txt b/esp32/main/CMakeLists.txt
 index a4df3ba..667f286 100644
@@ -73,7 +83,7 @@ index c23a323..c3a8469 100644
      if (!setup_complete) {
          // Unpaired devices advertise automatically — no button press is needed
 diff --git a/esp32/main/glasses_capture.c b/esp32/main/glasses_capture.c
-index d83591f..6910623 100644
+index d83591f..b6527ea 100644
 --- a/esp32/main/glasses_capture.c
 +++ b/esp32/main/glasses_capture.c
 @@ -18,11 +18,28 @@
@@ -130,7 +140,7 @@ index d83591f..6910623 100644
          goto done;
      }
      content_length = esp_http_client_fetch_headers(client);
-@@ -94,12 +114,228 @@ done:
+@@ -94,12 +114,249 @@ done:
      return body;
  }
  
@@ -141,8 +151,24 @@ index d83591f..6910623 100644
 +static char s_phone_url[64];
 +static portMUX_TYPE s_phone_lock = portMUX_INITIALIZER_UNLOCKED;
 +
++static SemaphoreHandle_t s_mdns_lock;   /* one lookup at a time: mDNS is started and stopped around it */
++
++static bool discover_phone_locked(void);
++
 +/* Asks the network (mDNS/DNS-SD) where the Glasses Bridge app is. */
 +static bool discover_phone(void)
++{
++    if (s_mdns_lock) {
++        xSemaphoreTake(s_mdns_lock, portMAX_DELAY);
++    }
++    bool found = discover_phone_locked();
++    if (s_mdns_lock) {
++        xSemaphoreGive(s_mdns_lock);
++    }
++    return found;
++}
++
++static bool discover_phone_locked(void)
 +{
 +    esp_err_t err = mdns_init();
 +    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {   /* INVALID_STATE: already running */
@@ -152,6 +178,7 @@ index d83591f..6910623 100644
 +    mdns_result_t *results = NULL;
 +    if (mdns_query_ptr(PHONE_SERVICE, "_tcp", 2000, 1, &results) != ESP_OK || !results) {
 +        ESP_LOGW(TAG, "no Glasses Bridge app found on the network");
++        mdns_free();   /* its task and buffers are internal RAM the display needs */
 +        return false;
 +    }
 +    char url[sizeof(s_phone_url)] = "";
@@ -176,6 +203,7 @@ index d83591f..6910623 100644
 +        }
 +    }
 +    mdns_query_results_free(results);
++    mdns_free();   /* only needed while looking: its task and buffers are internal RAM */
 +    if (!url[0]) {
 +        ESP_LOGW(TAG, "Glasses Bridge app answered without a usable address");
 +    }
@@ -315,6 +343,9 @@ index d83591f..6910623 100644
 +    if (s_task || !(s_lock = xSemaphoreCreateMutex())) {
 +        return;
 +    }
++#if CONFIG_HOMEHUB_GLASSES_DISCOVER
++    s_mdns_lock = xSemaphoreCreateMutex();
++#endif
 +    if (xTaskCreateWithCaps(prefetch_task, "glasses_pre", 6144, NULL, 4, &s_task,
 +                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
 +        s_task = NULL;
@@ -360,7 +391,7 @@ index d83591f..6910623 100644
      if (!jpeg) {
          ESP_LOGW(TAG, "capture failed: %s", *error);
          return false;
-@@ -116,7 +352,7 @@ bool glasses_capture(char **jpeg_base64, const char **error)
+@@ -116,7 +373,7 @@ bool glasses_capture(char **jpeg_base64, const char **error)
      }
      out[olen] = '\0';
      free(jpeg);

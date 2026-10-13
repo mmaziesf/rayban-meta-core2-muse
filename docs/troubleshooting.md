@@ -34,6 +34,7 @@ Every problem below actually happened while building this project.
 | The standalone firmware shows nothing | Frames over 15 KB get dropped; the relay keeps them under 14 KB. Check `RELAY_HOST` in `secrets.h` |
 | The Core2 can't join Wi-Fi | It's 2.4 GHz only; check the router broadcasts 2.4 GHz |
 | Log says `no Glasses Bridge app found on the network` | The app isn't open, or iOS **Local Network** access is off for it (Settings → Privacy & Security → Local Network). Check with `avahi-browse -rt _glasses-bridge._tcp`. Phone and Core2 must be on the same network, with no client isolation |
+| The avatar freezes or animates choppily, while voice still works | Internal RAM is short: the display's SPI transfers need DMA-capable internal RAM. Watch the heartbeat log line, `int=…K/… dma=…K/…`: when idle, about 49 KB internal and 29 KB DMA is healthy on the Core2 v1.1. Anything kept alive between turns (connections, tasks, buffers under 4 KB, which always go to internal RAM) eats into it. Patches 0003/0004 free the speech connections and mDNS after use for this reason |
 | The Core2 acts by itself (talk button presses, test MP3s) while a log reader is open | The serial port has echo on: the log is echoed back into the console, which takes letters as bench commands. Use `stty -F /dev/ttyACM0 raw -echo` (or a raw-mode reader) |
 
 ## Voice

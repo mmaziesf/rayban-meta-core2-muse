@@ -64,7 +64,7 @@ A new command, `glasses.capture`, behind the option
 
 ## Patch 3: voice
 
-Wake word, speech server, end-of-speech detection and kept connections are
+Wake word, speech server, end-of-speech detection and per-turn connections are
 described in [voice.md](voice.md).
 
 ## Patch 4: frames from the phone, pre-armed
@@ -76,9 +76,11 @@ described in [voice.md](voice.md).
 - **Finding the phone.** The Core2 looks it up with mDNS (the
   `espressif/mdns` component: a PTR query, then SRV, then A when the answer
   carries no address). It does this as soon as Wi-Fi is up, then every 30 s
-  until found, and again whenever the phone stops answering. If the phone
-  can't be found, it uses `CONFIG_HOMEHUB_GLASSES_CAPTURE_URL`; leave that
-  empty to use the phone only.
+  until found, and again whenever the phone stops answering. mDNS runs only
+  during a lookup and is freed after it, because its task and buffers take
+  internal RAM the display needs. If the phone can't be found, the Core2
+  uses `CONFIG_HOMEHUB_GLASSES_CAPTURE_URL`; leave that empty to use the
+  phone only.
 - **Pre-armed.** Each voice turn fetches a frame in the background the
   moment it starts (wake word or tap). When Muse calls `glasses.capture` a
   few seconds later, the frame of the moment you asked is already in memory.

@@ -118,12 +118,32 @@ The Core2 tracks the room's background level and your voice level:
 
 ### Connections
 
-- **Kept open.** The Core2 keeps one connection each for `/stt` and `/tts`,
-  using HTTP keep-alive. The server closes idle ones after 120 s.
-- **Opened early.** Each turn opens both connections with `GET /health` as
-  soon as it starts listening, so a TLS handshake to a cloud server happens
-  while you're still talking.
-- **Faster reconnects.** TLS session tickets make reconnecting cheaper.
+- **One connection per endpoint, for one turn.** The Core2 opens a
+  connection each for `/stt` and `/tts` with `GET /health` as soon as a turn
+  starts listening. A TLS handshake to a cloud server, about 0.3–1 s on an
+  ESP32, then happens while you're still talking. The turn's requests (the
+  transcript, then each sentence of the reply) reuse those connections
+  through HTTP keep-alive. The server closes idle ones after 120 s.
+- **Freed when the turn ends.** Keeping the connections between turns looked
+  cheaper, but it froze the avatar:
+  - The HTTP client's buffers are 2 KB each, under the SDK's 4 KB
+    "always internal" malloc threshold, so they live in internal RAM.
+  - The display's SPI transfers need DMA-capable internal RAM.
+  - With the connections (and mDNS) kept, idle internal RAM fell from 50 to
+    34 KB, and the DMA pool from 29 to 14 KB, with a 7 KB largest block
+    during a turn.
+
+  Freeing them at the end of each turn brings idle memory back to boot
+  levels (49 KB internal, 29 KB DMA).
+- **Stale connections.** If a request fails before any response (the server
+  closed the connection), it's retried once on a brand-new client. Reusing
+  the old client after a reset hit stale esp-tls state.
+- **Faster reconnects.** For `https://` URLs, TLS session tickets let a new
+  connection resume the previous session.
+- **Voice can't interrupt a reply.** While the Core2 is speaking it doesn't
+  listen for the wake word. A tap on the touch strip still interrupts, and a
+  cancelled reply closes its connection at once instead of downloading the
+  rest of the sentence.
 
 ## Measured latency
 

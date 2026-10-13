@@ -1,25 +1,48 @@
-From c12591cf26fcd93facd0166a15bca47d11ced891 Mon Sep 17 00:00:00 2001
+From afc1a90880edea2625e4620ef9e183e563a6d0e0 Mon Sep 17 00:00:00 2001
 From: Milad <mmaziesf@uwaterloo.ca>
-Date: Mon, 12 Oct 2026 20:44:51 -0700
+Date: Mon, 12 Oct 2026 21:48:57 -0700
 Subject: [PATCH 3/4] Muse voice: spoken replies, local speech-to-text,
  hands-free turns, wake word
 
-- MUSE_TTS: each reply is spoken by a text-to-speech server of your own
-  (MP3 streamed sentence by sentence, captions follow the speech); a short
-  filler is spoken while Muse thinks.
+Turns the gadget into a hands-free voice assistant backed by a speech
+server of your own (glasses-bridge's speech_server.py or any server with
+the same /stt, /tts and /health endpoints). Everything is off by default;
+the Core2 v1.1 profile turns it on.
+
+- MUSE_TTS: each reply is spoken by your text-to-speech server: MP3
+  streamed sentence by sentence as the reply arrives, captions following
+  the speech. A short filler ("Hmm, let me think.") is spoken while Muse
+  thinks. Muted speaker or unreachable server: the reply shows as text.
 - MUSE_LOCAL_STT: the recording is transcribed on your server and sent to
-  Muse as text (a voice note if the server fails). At the first pause the
-  speech so far is transcribed early and reused if nothing more is said;
-  a transcript that reads finished ends the turn at once.
-- MUSE_HANDS_FREE: a tap starts a turn that ends when you stop speaking;
-  optional follow-up window (MUSE_FOLLOW_UP_S).
-- MUSE_WAKE_WORD: on-device "Hey Jarvis" (microWakeWord v2 model, Apache-2.0,
-  on TFLite Micro with the vendored TF audio microfrontend), arena in PSRAM.
-- Speech server connections are kept open and opened at the start of each
-  turn; https:// URLs are verified against the CA bundle and
+  Muse as text with MUSE_VOICE_NOTE_HINT; if the server fails it goes up
+  as a voice note as before.
+- Faster end of speech: at the first 200 ms pause the speech so far is
+  transcribed early, and the turn's end reuses that transcript when
+  nothing more was said (Muse gets the text ~0.1-0.2 s after you stop
+  instead of ~0.6 s). A transcript that reads finished ends the turn at
+  once; one that reads unfinished, or is only the wake word, waits up
+  to 1.5 s for the rest.
+- MUSE_HANDS_FREE: a tap starts a turn that ends when you stop talking
+  (holding still works as push-to-talk), detected against the room's
+  floor and the speaker's level; optional follow-up window
+  (MUSE_FOLLOW_UP_S, 0 on the Core2: every turn starts with the wake word).
+- MUSE_WAKE_WORD: on-device "Hey Jarvis" (microWakeWord v2 model,
+  Apache-2.0) on TFLite Micro, with the TF audio microfrontend vendored
+  in components/microfrontend (esp-tflite-micro 1.4.1 no longer ships
+  it). The 18 KB arena is in PSRAM: the Core2 reallocates its I2S DMA
+  buffers on every mic/speaker switch and an internal arena starved them.
+  The streaming model and frontend are reset at every turn so the wake
+  word just heard can't fire again.
+- Speech server connections: one per endpoint, opened with GET /health as
+  a turn starts listening (so a TLS handshake overlaps the question),
+  reused for the turn's requests, and freed when the turn ends: their
+  buffers fall under the 4 KB always-internal malloc threshold, and kept
+  between turns they took the internal RAM the display's DMA transfers
+  need (the avatar froze). A connection that fails before any response
+  is retried on a new client. https:// URLs are verified against the CA
+  bundle, TLS sessions are resumed (session tickets), and
   MUSE_SPEECH_TOKEN is sent as a bearer token.
 - muse_voice_set_turn_hook lets the app act as each turn starts.
-- Core2 v1.1 profile enables all of the above.
 ---
  esp32/components/microfrontend/CMakeLists.txt |  22 +
  esp32/components/microfrontend/README.md      |   7 +
@@ -63,20 +86,20 @@ Subject: [PATCH 3/4] Muse voice: spoken replies, local speech-to-text,
  esp32/components/muse/idf_component.yml       |   4 +
  esp32/components/muse/muse_chat.h             |  12 +
  esp32/components/muse/muse_chat_session.cpp   | 454 +++++++++++++++++-
- esp32/components/muse/muse_speech_http.c      |  80 +++
- esp32/components/muse/muse_speech_http.h      |  44 ++
- esp32/components/muse/muse_stt_fetch.c        | 170 +++++++
- esp32/components/muse/muse_stt_fetch.h        |  52 ++
- esp32/components/muse/muse_tts_fetch.c        | 199 ++++++++
- esp32/components/muse/muse_tts_fetch.h        |  56 +++
- esp32/components/muse/muse_voice.c            | 203 +++++++-
+ esp32/components/muse/muse_speech_http.c      |  78 +++
+ esp32/components/muse/muse_speech_http.h      |  48 ++
+ esp32/components/muse/muse_stt_fetch.c        | 208 ++++++++
+ esp32/components/muse/muse_stt_fetch.h        |  55 +++
+ esp32/components/muse/muse_tts_fetch.c        | 236 +++++++++
+ esp32/components/muse/muse_tts_fetch.h        |  59 +++
+ esp32/components/muse/muse_voice.c            | 211 +++++++-
  esp32/components/muse/muse_voice.h            |   4 +
  esp32/components/muse/muse_wake.cc            | 265 ++++++++++
  esp32/components/muse/muse_wake.h             |  44 ++
  esp32/components/muse/wake/README.md          |  10 +
  esp32/components/muse/wake/wake_word.tflite   | Bin 0 -> 52272 bytes
  .../devices/sdkconfig.muse-m5stack-core2-v11  |  19 +
- 55 files changed, 3842 insertions(+), 13 deletions(-)
+ 55 files changed, 3933 insertions(+), 13 deletions(-)
  create mode 100644 esp32/components/microfrontend/CMakeLists.txt
  create mode 100644 esp32/components/microfrontend/README.md
  create mode 100644 esp32/components/microfrontend/idf_component.yml
@@ -3262,10 +3285,10 @@ index a6ad810..1adeb21 100644
      post(CMD_END, s_gen.load());
 diff --git a/esp32/components/muse/muse_speech_http.c b/esp32/components/muse/muse_speech_http.c
 new file mode 100644
-index 0000000..98649c5
+index 0000000..c662aed
 --- /dev/null
 +++ b/esp32/components/muse/muse_speech_http.c
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,78 @@
 +/*
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -3305,7 +3328,8 @@ index 0000000..98649c5
 +        .crt_bundle_attach = esp_crt_bundle_attach,
 +        .keep_alive_enable = true,   /* TCP keep-alive probes notice a dead link */
 +#if CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS
-+        .save_client_session = true, /* a new TLS connection resumes the last session */
++        /* A new TLS connection resumes the last session (plain HTTP has none to save). */
++        .save_client_session = strncmp(url, "https://", 8) == 0,
 +#endif
 +    };
 +    esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -3315,19 +3339,16 @@ index 0000000..98649c5
 +    return client;
 +}
 +
-+esp_err_t muse_speech_perform(esp_http_client_handle_t client)
++bool muse_speech_stale(esp_err_t err)
 +{
-+    esp_err_t err = esp_http_client_perform(client);
 +    if (err == ESP_ERR_HTTP_CONNECTION_CLOSED || err == ESP_ERR_HTTP_FETCH_HEADER || err == ESP_ERR_HTTP_WRITE_DATA) {
-+        /* Failed before any response: the kept connection had gone stale. */
-+        ESP_LOGI(TAG, "kept connection gone (%s): reconnecting", esp_err_to_name(err));
-+        esp_http_client_close(client);
-+        err = esp_http_client_perform(client);
++        ESP_LOGI(TAG, "kept connection gone (%s): retrying on a new one", esp_err_to_name(err));
++        return true;
 +    }
-+    return err;
++    return false;
 +}
 +
-+bool muse_speech_prewarm(esp_http_client_handle_t client, const char *url)
++esp_err_t muse_speech_prewarm(esp_http_client_handle_t client, const char *url)
 +{
 +    char health[192];
 +    const char *host = strstr(url, "://");
@@ -3338,20 +3359,20 @@ index 0000000..98649c5
 +    esp_http_client_set_url(client, health);
 +    esp_http_client_set_method(client, HTTP_METHOD_GET);
 +    esp_http_client_set_post_field(client, NULL, 0);
-+    esp_err_t err = muse_speech_perform(client);
++    esp_err_t err = esp_http_client_perform(client);
 +    int status = esp_http_client_get_status_code(client);
 +    ESP_LOGI(TAG, "connection to %.*s ready in %d ms (HTTP %d%s)", base, url,
 +             (int)((esp_timer_get_time() - t0) / 1000), status, err == ESP_OK ? "" : ", failed");
-+    return err == ESP_OK && status == 200;
++    return err != ESP_OK ? err : status == 200 ? ESP_OK : ESP_FAIL;
 +}
 +
 +#endif
 diff --git a/esp32/components/muse/muse_speech_http.h b/esp32/components/muse/muse_speech_http.h
 new file mode 100644
-index 0000000..128808b
+index 0000000..b8bbfad
 --- /dev/null
 +++ b/esp32/components/muse/muse_speech_http.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,48 @@
 +/*
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -3378,30 +3399,34 @@ index 0000000..128808b
 +#endif
 +
 +/*
-+ * The speech server connections (muse_tts_fetch, muse_stt_fetch): one kept
-+ * open per use, so a request reuses the TCP (and TLS) connection of the one
-+ * before. https:// URLs are checked against the built-in CA bundle, and
++ * The speech server connections (muse_tts_fetch, muse_stt_fetch): kept open
++ * for the length of a voice turn, so the turn's requests (the transcript,
++ * each sentence of the reply) reuse one TCP (and TLS) connection, and opened
++ * as the turn starts. They're freed when the turn ends: their buffers sit in
++ * internal RAM, which the display's DMA transfers need.
++ * https:// URLs are checked against the built-in CA bundle, and
 + * CONFIG_MUSE_SPEECH_TOKEN, when set, goes in each request as a bearer token.
 + */
 +
 +/* A client for url that keeps its connection; handler gets the response data. */
 +esp_http_client_handle_t muse_speech_client(const char *url, int timeout_ms, http_event_handle_cb handler);
 +
-+/* esp_http_client_perform, once more on a fresh connection if the kept one had gone stale. */
-+esp_err_t muse_speech_perform(esp_http_client_handle_t client);
++/* True if err means the kept connection failed before any response (the
++ * server closed it): retry the request on a new client. */
++bool muse_speech_stale(esp_err_t err);
 +
 +/* Opens (or checks) the connection ahead of a request: GET /health on url's server. */
-+bool muse_speech_prewarm(esp_http_client_handle_t client, const char *url);
++esp_err_t muse_speech_prewarm(esp_http_client_handle_t client, const char *url);
 +
 +#ifdef __cplusplus
 +}
 +#endif
 diff --git a/esp32/components/muse/muse_stt_fetch.c b/esp32/components/muse/muse_stt_fetch.c
 new file mode 100644
-index 0000000..6bc2505
+index 0000000..34b5c0f
 --- /dev/null
 +++ b/esp32/components/muse/muse_stt_fetch.c
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,208 @@
 +/*
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -3466,26 +3491,57 @@ index 0000000..6bc2505
 +    return ESP_OK;
 +}
 +
++static void drop_client(void)
++{
++    if (s_client) {
++        esp_http_client_cleanup(s_client);
++        s_client = NULL;
++    }
++}
++
++/* One request on the kept connection, or on a new one if that had gone stale. */
++static esp_err_t request(const job_t *job)
++{
++    esp_err_t err = ESP_FAIL;
++    for (int attempt = 0; attempt < 2; attempt++) {
++        if (!s_client) {
++            s_client = muse_speech_client(CONFIG_MUSE_STT_URL, 8000, on_event);
++        }
++        if (!s_client) {
++            return ESP_ERR_NO_MEM;
++        }
++        if (!job->pcm) {
++            err = muse_speech_prewarm(s_client, CONFIG_MUSE_STT_URL);
++        } else {
++            char url[sizeof(CONFIG_MUSE_STT_URL) + 24];
++            snprintf(url, sizeof(url), "%s?rate=%d", CONFIG_MUSE_STT_URL, job->rate);
++            esp_http_client_set_url(s_client, url);
++            esp_http_client_set_method(s_client, HTTP_METHOD_POST);
++            esp_http_client_set_header(s_client, "Content-Type", "application/octet-stream");
++            esp_http_client_set_post_field(s_client, (const char *)job->pcm, (int)(job->samples * sizeof(int16_t)));
++            s_got_len = 0;
++            err = esp_http_client_perform(s_client);
++            esp_http_client_set_post_field(s_client, NULL, 0);
++        }
++        if (err == ESP_OK || attempt || !muse_speech_stale(err)) {
++            break;
++        }
++        drop_client();
++    }
++    if (err != ESP_OK && err != ESP_FAIL) {
++        drop_client();   /* never reuse a connection in an unknown state */
++    }
++    return err;
++}
++
 +static void stt_task(void *arg)
 +{
 +    job_t job = *(job_t *)arg;
 +    free(arg);
-+    if (!s_client) {
-+        s_client = muse_speech_client(CONFIG_MUSE_STT_URL, 8000, on_event);
-+    }
++    esp_err_t err = request(&job);
 +    int result = -1;
-+    if (s_client && !job.pcm) {
-+        muse_speech_prewarm(s_client, CONFIG_MUSE_STT_URL);
-+    } else if (s_client) {
-+        char url[sizeof(CONFIG_MUSE_STT_URL) + 24];
-+        snprintf(url, sizeof(url), "%s?rate=%d", CONFIG_MUSE_STT_URL, job.rate);
-+        esp_http_client_set_url(s_client, url);
-+        esp_http_client_set_method(s_client, HTTP_METHOD_POST);
-+        esp_http_client_set_header(s_client, "Content-Type", "application/octet-stream");
-+        esp_http_client_set_post_field(s_client, (const char *)job.pcm, (int)(job.samples * sizeof(int16_t)));
-+        s_got_len = 0;
-+        esp_err_t err = muse_speech_perform(s_client);
-+        int status = esp_http_client_get_status_code(s_client);
++    if (job.pcm) {
++        int status = s_client ? esp_http_client_get_status_code(s_client) : 0;
 +        if (err == ESP_OK && status == 200) {
 +            s_got[s_got_len] = '\0';
 +            result = 1;
@@ -3493,9 +3549,7 @@ index 0000000..6bc2505
 +            ESP_LOGW(TAG, "speech server answered HTTP %d", status);
 +        } else {
 +            ESP_LOGW(TAG, "speech server unreachable (%s): %s", esp_err_to_name(err), CONFIG_MUSE_STT_URL);
-+            esp_http_client_close(s_client);
 +        }
-+        esp_http_client_set_post_field(s_client, NULL, 0);
 +    }
 +    if (job.pcm && atomic_load(&s_gen) == job.gen) {
 +        strlcpy(s_text, result > 0 ? s_got : "", sizeof(s_text));
@@ -3571,13 +3625,22 @@ index 0000000..6bc2505
 +    return atomic_load(&s_running);
 +}
 +
++void muse_stt_fetch_release(void)
++{
++    if (atomic_exchange(&s_running, true)) {
++        return;   /* a request is using it; the next release frees it */
++    }
++    drop_client();
++    atomic_store(&s_running, false);
++}
++
 +#endif /* CONFIG_MUSE_LOCAL_STT */
 diff --git a/esp32/components/muse/muse_stt_fetch.h b/esp32/components/muse/muse_stt_fetch.h
 new file mode 100644
-index 0000000..ffa4fa8
+index 0000000..0162f09
 --- /dev/null
 +++ b/esp32/components/muse/muse_stt_fetch.h
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,55 @@
 +/*
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -3627,15 +3690,18 @@ index 0000000..ffa4fa8
 + * transcription request doesn't pay for it; no-op while a request runs. */
 +void muse_stt_fetch_prewarm(void);
 +
++/* Closes the connection and frees its buffers (at the end of a turn). */
++void muse_stt_fetch_release(void);
++
 +#ifdef __cplusplus
 +}
 +#endif
 diff --git a/esp32/components/muse/muse_tts_fetch.c b/esp32/components/muse/muse_tts_fetch.c
 new file mode 100644
-index 0000000..5f3acba
+index 0000000..fb2d3f5
 --- /dev/null
 +++ b/esp32/components/muse/muse_tts_fetch.c
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,236 @@
 +/*
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -3711,38 +3777,66 @@ index 0000000..5f3acba
 +    return ESP_OK;
 +}
 +
++static void drop_client(void)
++{
++    if (s_client) {
++        esp_http_client_cleanup(s_client);
++        s_client = NULL;
++    }
++}
++
++/* One request on the kept connection, or on a new one if that had gone stale. */
++static esp_err_t request(const job_t *job, size_t len)
++{
++    esp_err_t err = ESP_FAIL;
++    s_dropped = false;
++    for (int attempt = 0; attempt < 2; attempt++) {
++        if (!s_client) {
++            s_client = muse_speech_client(CONFIG_MUSE_TTS_URL, 15000, on_event);
++        }
++        if (!s_client) {
++            return ESP_ERR_NO_MEM;
++        }
++        if (!len) {
++            s_warming = true;
++            err = muse_speech_prewarm(s_client, CONFIG_MUSE_TTS_URL);
++            s_warming = false;
++        } else {
++            s_job_gen = job->gen;
++            s_dropped = false;
++            esp_http_client_set_url(s_client, CONFIG_MUSE_TTS_URL);
++            esp_http_client_set_method(s_client, HTTP_METHOD_POST);
++            esp_http_client_set_header(s_client, "Content-Type", "text/plain; charset=utf-8");
++            esp_http_client_set_post_field(s_client, job->text, (int)len);
++            err = esp_http_client_perform(s_client);
++            esp_http_client_set_post_field(s_client, NULL, 0);
++        }
++        if (err == ESP_OK || s_dropped || attempt || !muse_speech_stale(err)) {
++            break;
++        }
++        drop_client();
++    }
++    if (s_dropped || (err != ESP_OK && err != ESP_FAIL)) {
++        drop_client();   /* closed mid-reply, or in an unknown state: never reuse it */
++    }
++    return err;
++}
++
 +static void fetch_task(void *arg)
 +{
 +    job_t *job = arg;
-+    int result = -1;
-+    if (!s_client) {
-+        s_client = muse_speech_client(CONFIG_MUSE_TTS_URL, 15000, on_event);
-+    }
 +    size_t len = strlen(job->text);
-+    if (s_client && !len) {
-+        s_warming = true;
-+        muse_speech_prewarm(s_client, CONFIG_MUSE_TTS_URL);
-+        s_warming = false;
-+    } else if (s_client) {
-+        s_job_gen = job->gen;
-+        s_dropped = false;
-+        esp_http_client_set_url(s_client, CONFIG_MUSE_TTS_URL);
-+        esp_http_client_set_method(s_client, HTTP_METHOD_POST);
-+        esp_http_client_set_header(s_client, "Content-Type", "text/plain; charset=utf-8");
-+        esp_http_client_set_post_field(s_client, job->text, (int)len);
-+        esp_err_t err = muse_speech_perform(s_client);
-+        int status = esp_http_client_get_status_code(s_client);
-+        if (s_dropped) {
-+            result = -1;
-+        } else if (err == ESP_OK && status == 200) {
++    esp_err_t err = request(job, len);
++    int result = -1;
++    if (len && !s_dropped) {
++        int status = s_client ? esp_http_client_get_status_code(s_client) : 0;
++        if (err == ESP_OK && status == 200) {
 +            result = 1;
 +        } else if (err == ESP_OK) {
 +            ESP_LOGW(TAG, "speech server answered HTTP %d", status);
 +        } else {
 +            ESP_LOGW(TAG, "speech server unreachable (%s): %s", esp_err_to_name(err), CONFIG_MUSE_TTS_URL);
-+            esp_http_client_close(s_client);
 +        }
-+        esp_http_client_set_post_field(s_client, NULL, 0);
 +    }
 +    if (len && atomic_load(&s_gen) == job->gen) {
 +        atomic_store(&s_state, result);
@@ -3813,6 +3907,15 @@ index 0000000..5f3acba
 +    }
 +}
 +
++void muse_tts_fetch_release(void)
++{
++    if (atomic_exchange(&s_running, true)) {
++        return;   /* a fetch is using it; the next release frees it */
++    }
++    drop_client();
++    atomic_store(&s_running, false);
++}
++
 +size_t muse_tts_fetch_read(void *buf, size_t cap)
 +{
 +    return s_buf ? xStreamBufferReceive(s_buf, buf, cap, 0) : 0;
@@ -3837,10 +3940,10 @@ index 0000000..5f3acba
 +#endif /* CONFIG_MUSE_TTS */
 diff --git a/esp32/components/muse/muse_tts_fetch.h b/esp32/components/muse/muse_tts_fetch.h
 new file mode 100644
-index 0000000..12c5318
+index 0000000..f8c9843
 --- /dev/null
 +++ b/esp32/components/muse/muse_tts_fetch.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,59 @@
 +/*
 + * Copyright (c) Meta Platforms, Inc. and affiliates.
 + *
@@ -3894,11 +3997,14 @@ index 0000000..12c5318
 + * first reply doesn't pay for it; no-op while a fetch runs. */
 +void muse_tts_fetch_prewarm(void);
 +
++/* Closes the connection and frees its buffers (at the end of a turn). */
++void muse_tts_fetch_release(void);
++
 +#ifdef __cplusplus
 +}
 +#endif
 diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
-index 35a7ff4..f7244c7 100644
+index 35a7ff4..192a46c 100644
 --- a/esp32/components/muse/muse_voice.c
 +++ b/esp32/components/muse/muse_voice.c
 @@ -37,6 +37,11 @@
@@ -4075,7 +4181,22 @@ index 35a7ff4..f7244c7 100644
              released = true;
              stop_at = n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
          }
-@@ -845,14 +969,46 @@ static void voice_task(void *arg)
+@@ -434,6 +558,14 @@ static void go_idle(const char *caption)
+     muse_state_set_progress(0);
+     muse_state_set_mode(MUSE_MODE_IDLE);
+     muse_state_set_caption("%s", caption);
++    /* The turn is over: give the speech connections' internal RAM back to
++     * the display. The next turn opens them again as it starts listening. */
++#if CONFIG_MUSE_LOCAL_STT
++    muse_stt_fetch_release();
++#endif
++#if CONFIG_MUSE_TTS
++    muse_tts_fetch_release();
++#endif
+ }
+ 
+ /* Why a press can't go to Hatch; voice notes only go there. */
+@@ -845,14 +977,46 @@ static void voice_task(void *arg)
              }
              /* The 20 ms read paces this loop. */
              idle_capture();
@@ -4128,7 +4249,7 @@ index 35a7ff4..f7244c7 100644
          }
          if (wake && !held_on_waking()) {
              continue;   /* a tap: it only woke Muse */
-@@ -866,7 +1022,20 @@ static void voice_task(void *arg)
+@@ -866,7 +1030,20 @@ static void voice_task(void *arg)
          char why[96];
          bool ok = record(pending_down, &held, why, sizeof(why));
          pending_down = false;
@@ -4149,7 +4270,7 @@ index 35a7ff4..f7244c7 100644
              muse_hatch_turn_cancel();
              drop_rec();
              pre_reset();
-@@ -880,10 +1049,26 @@ static void voice_task(void *arg)
+@@ -880,10 +1057,26 @@ static void voice_task(void *arg)
          }
          pending_down = finish_note();
          pre_reset();
@@ -4176,7 +4297,7 @@ index 35a7ff4..f7244c7 100644
      }
  }
  
-@@ -896,6 +1081,12 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
+@@ -896,6 +1089,12 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
          muse_state_set_caption("AUDIO INIT FAILED");
          return ESP_FAIL;
      }

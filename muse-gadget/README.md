@@ -6,7 +6,7 @@ at commit `812c46f` (2026-10-09):
 1. `0001`: M5Stack Core2 **v1.1** (AXP2101 PMU) support, as a new `core2v11` build profile.
 2. `0002`: the `glasses.capture` command, so Muse can see the latest Ray-Ban Meta frame.
 3. `0003`: voice: on-device "Hey Jarvis" wake word, spoken replies and transcription on your
-   speech server, hands-free turns that end when you stop talking, kept connections.
+   speech server, hands-free turns that end when you stop talking, connections opened at the wake word.
 4. `0004`: glasses frames straight from the iPhone app (mDNS), fetched as each turn starts.
 
 ```sh

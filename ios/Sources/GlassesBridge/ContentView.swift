@@ -56,7 +56,9 @@ struct ContentView: View {
 
   private var streamSection: some View {
     Section {
-      TextField("PC address (host:port)", text: $model.host)
+      Toggle("Serve frames to Core2", isOn: $model.serveToCore2)
+        .disabled(model.isRunning)
+      TextField("PC address (host:port, optional)", text: $model.host)
         .keyboardType(.numbersAndPunctuation)
         .textInputAutocapitalization(.never)
         .autocorrectionDisabled()
@@ -89,9 +91,10 @@ struct ContentView: View {
           .disabled(model.registration != .registered)
       }
     } header: {
-      Text("Stream to computer")
+      Text("Stream")
     } footer: {
-      Text("Run the viewer on the PC first. Settings apply on the next Start.")
+      Text("The Core2 finds this phone on Wi-Fi and fetches the latest frame when Muse asks. "
+        + "A PC address also streams to the viewer (run it first). Settings apply on the next Start.")
     }
   }
 
@@ -99,7 +102,9 @@ struct ContentView: View {
     Section("Status") {
       LabeledContent("Session", value: model.sessionState.description)
       LabeledContent("Camera", value: BridgeModel.label(for: model.streamState))
-      LabeledContent("PC link", value: linkText)
+      LabeledContent("Core2 server", value: core2Text)
+      LabeledContent("Core2 frames", value: "\(model.core2Served) sent, last \(model.core2LastRequest)")
+      LabeledContent("PC link", value: model.host.trimmingCharacters(in: .whitespaces).isEmpty ? "not used" : linkText)
       LabeledContent("Frames", value: "\(model.fpsIn) in / \(model.fpsOut) out per s")
       LabeledContent("Upload", value: "\(model.kilobytesPerSecond) KB/s")
     }
@@ -111,6 +116,14 @@ struct ContentView: View {
         Text(line)
           .font(.caption.monospaced())
       }
+    }
+  }
+
+  private var core2Text: String {
+    switch model.core2Server {
+    case .stopped: "off"
+    case .listening(let port): "listening on port \(port)"
+    case .failed(let reason): "failed: \(reason)"
     }
   }
 

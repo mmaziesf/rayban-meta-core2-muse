@@ -1,0 +1,418 @@
+From 3a3aea80096b8d9761f246a4bf9cbe14821c6369 Mon Sep 17 00:00:00 2001
+From: Milad <mmaziesf@uwaterloo.ca>
+Date: Mon, 12 Oct 2026 20:44:51 -0700
+Subject: [PATCH 4/4] glasses.capture: frames straight from the iPhone app,
+ pre-armed per turn
+
+HOMEHUB_GLASSES_DISCOVER finds the Glasses Bridge app over mDNS
+(_glasses-bridge._tcp, espressif/mdns) and fetches /snapshot.jpg from the
+phone, falling back to HOMEHUB_GLASSES_CAPTURE_URL. The phone is looked up
+as soon as Wi-Fi is up, and each voice turn fetches a frame in the
+background so glasses.capture answers from memory.
+---
+ esp32/main/CMakeLists.txt    |   7 +
+ esp32/main/Kconfig.projbuild |  14 +-
+ esp32/main/app.c             |   3 +
+ esp32/main/glasses_capture.c | 246 ++++++++++++++++++++++++++++++++++-
+ esp32/main/glasses_capture.h |  20 ++-
+ esp32/main/idf_component.yml |   4 +
+ 6 files changed, 284 insertions(+), 10 deletions(-)
+
+diff --git a/esp32/main/CMakeLists.txt b/esp32/main/CMakeLists.txt
+index a4df3ba..667f286 100644
+--- a/esp32/main/CMakeLists.txt
++++ b/esp32/main/CMakeLists.txt
+@@ -116,3 +116,10 @@ idf_component_register(
+     PRIV_INCLUDE_DIRS "../avatar"
+     REQUIRES ${GADGET_REQUIRES}
+ )
++
++# Kconfig isn't known when requirements are expanded, so mDNS (a managed
++# component, fetched only when discovery is on) is linked here instead.
++if(CONFIG_HOMEHUB_GLASSES_DISCOVER)
++    idf_component_get_property(mdns_lib espressif__mdns COMPONENT_LIB)
++    target_link_libraries(${COMPONENT_LIB} PRIVATE ${mdns_lib})
++endif()
+diff --git a/esp32/main/Kconfig.projbuild b/esp32/main/Kconfig.projbuild
+index 837a298..34c4e74 100644
+--- a/esp32/main/Kconfig.projbuild
++++ b/esp32/main/Kconfig.projbuild
+@@ -333,7 +333,19 @@ menu "ESP32 Device SDK"
+             HTTP URL that returns the latest glasses frame as one JPEG, or
+             503 while the glasses are not streaming. Set it per device to the
+             relay computer's address (idf.py menuconfig, or the build
+-            directory's sdkconfig), as with the SDK token.
++            directory's sdkconfig), as with the SDK token. With
++            HOMEHUB_GLASSES_DISCOVER it is the fallback for when no phone is
++            found; leave it empty to use the phone only.
++
++    config HOMEHUB_GLASSES_DISCOVER
++        bool "Find the Glasses Bridge iPhone app on the network (mDNS)"
++        depends on HOMEHUB_GLASSES_CAPTURE
++        default n
++        help
++            Fetch frames straight from the Glasses Bridge app, which serves
++            /snapshot.jpg and advertises _glasses-bridge._tcp over Bonjour,
++            so no relay computer is needed. The phone's address is looked up
++            when a frame is first wanted and again whenever it stops answering.
+ 
+     config HOMEHUB_DISPLAY_COMMANDS
+         bool
+diff --git a/esp32/main/app.c b/esp32/main/app.c
+index c23a323..c3a8469 100644
+--- a/esp32/main/app.c
++++ b/esp32/main/app.c
+@@ -2693,6 +2693,9 @@ void app_run(void) {
+ #if CONFIG_HOMEHUB_RETERMINAL_SHT4X
+     reterminal_sht4x_init();
+ #endif
++#if CONFIG_HOMEHUB_GLASSES_CAPTURE
++    glasses_capture_start();
++#endif
+ 
+     if (!setup_complete) {
+         // Unpaired devices advertise automatically — no button press is needed
+diff --git a/esp32/main/glasses_capture.c b/esp32/main/glasses_capture.c
+index d83591f..6910623 100644
+--- a/esp32/main/glasses_capture.c
++++ b/esp32/main/glasses_capture.c
+@@ -18,11 +18,28 @@
+ #include <stdint.h>
+ #include <stdlib.h>
+ 
++#include <stdio.h>
++#include <string.h>
++
+ #include "esp_heap_caps.h"
+ #include "esp_http_client.h"
+ #include "esp_log.h"
++#include "esp_timer.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/idf_additions.h"
++#include "freertos/semphr.h"
++#include "freertos/task.h"
+ #include "mbedtls/base64.h"
+ #include "sdkconfig.h"
++#include "wifi_mgr.h"
++
++#if CONFIG_MUSE_ENABLED
++#include "muse_voice.h"
++#endif
++
++#if CONFIG_HOMEHUB_GLASSES_DISCOVER
++#include "mdns.h"
++#endif
+ 
+ static const char *TAG = "link.glasses";
+ 
+@@ -36,11 +53,13 @@ static void *psram_alloc(size_t len)
+     return p ? p : malloc(len);
+ }
+ 
+-/* Reads the whole body; *len is the byte count. Returns NULL with *error set. */
+-static uint8_t *fetch(size_t *len, const char **error)
++/* Reads the whole body; *len is the byte count. Returns NULL with *error set,
++ * and *unreachable when nothing answered at that address. */
++static uint8_t *fetch(const char *url, size_t *len, const char **error, bool *unreachable)
+ {
++    *unreachable = false;
+     esp_http_client_config_t cfg = {
+-        .url = CONFIG_HOMEHUB_GLASSES_CAPTURE_URL,
++        .url = url,
+         .timeout_ms = 8000,
+         .buffer_size = 4096,
+     };
+@@ -55,6 +74,7 @@ static uint8_t *fetch(size_t *len, const char **error)
+     int status = 0;
+     if (esp_http_client_open(client, 0) != ESP_OK) {
+         *error = "glasses relay is not reachable on the home network";
++        *unreachable = true;
+         goto done;
+     }
+     content_length = esp_http_client_fetch_headers(client);
+@@ -94,12 +114,228 @@ done:
+     return body;
+ }
+ 
++#if CONFIG_HOMEHUB_GLASSES_DISCOVER
++#define PHONE_SERVICE "_glasses-bridge"
++
++/* The phone's snapshot URL from the last lookup; empty until found. */
++static char s_phone_url[64];
++static portMUX_TYPE s_phone_lock = portMUX_INITIALIZER_UNLOCKED;
++
++/* Asks the network (mDNS/DNS-SD) where the Glasses Bridge app is. */
++static bool discover_phone(void)
++{
++    esp_err_t err = mdns_init();
++    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {   /* INVALID_STATE: already running */
++        ESP_LOGW(TAG, "mDNS unavailable: %s", esp_err_to_name(err));
++        return false;
++    }
++    mdns_result_t *results = NULL;
++    if (mdns_query_ptr(PHONE_SERVICE, "_tcp", 2000, 1, &results) != ESP_OK || !results) {
++        ESP_LOGW(TAG, "no Glasses Bridge app found on the network");
++        return false;
++    }
++    char url[sizeof(s_phone_url)] = "";
++    for (mdns_result_t *r = results; r && !url[0]; r = r->next) {
++        if (!r->port) {
++            continue;
++        }
++        esp_ip4_addr_t ip = { 0 };
++        for (mdns_ip_addr_t *a = r->addr; a && !ip.addr; a = a->next) {
++            if (a->addr.type == ESP_IPADDR_TYPE_V4) {
++                ip = a->addr.u_addr.ip4;
++            }
++        }
++        /* Some answers carry only the SRV record: ask for the host's address. */
++        if (!ip.addr && r->hostname && mdns_query_a(r->hostname, 1500, &ip) != ESP_OK) {
++            ip.addr = 0;
++        }
++        ESP_LOGI(TAG, "mDNS: \"%s\" on %s.local port %u -> " IPSTR, r->instance_name ? r->instance_name : "?",
++                 r->hostname ? r->hostname : "?", r->port, IP2STR(&ip));
++        if (ip.addr) {
++            snprintf(url, sizeof(url), "http://" IPSTR ":%u/snapshot.jpg", IP2STR(&ip), r->port);
++        }
++    }
++    mdns_query_results_free(results);
++    if (!url[0]) {
++        ESP_LOGW(TAG, "Glasses Bridge app answered without a usable address");
++    }
++    taskENTER_CRITICAL(&s_phone_lock);
++    strlcpy(s_phone_url, url, sizeof(s_phone_url));
++    taskEXIT_CRITICAL(&s_phone_lock);
++    return url[0] != '\0';
++}
++
++/* Fetches from the phone, looking it up again if it moved or wasn't known. */
++static uint8_t *fetch_from_phone(size_t *len, const char **error, bool *found)
++{
++    char url[sizeof(s_phone_url)];
++    for (int attempt = 0; attempt < 2; attempt++) {
++        taskENTER_CRITICAL(&s_phone_lock);
++        strlcpy(url, s_phone_url, sizeof(url));
++        taskEXIT_CRITICAL(&s_phone_lock);
++        bool fresh = false;
++        if (!url[0]) {
++            if (!discover_phone()) {
++                break;
++            }
++            fresh = true;
++            taskENTER_CRITICAL(&s_phone_lock);
++            strlcpy(url, s_phone_url, sizeof(url));
++            taskEXIT_CRITICAL(&s_phone_lock);
++        }
++        bool unreachable;
++        uint8_t *jpeg = fetch(url, len, error, &unreachable);
++        if (jpeg || !unreachable) {
++            *found = true;   /* the app answered, with a frame or a reason */
++            if (!jpeg && !strstr(*error, "not streaming")) {
++                *error = "the Glasses Bridge app sent no usable frame";
++            }
++            return jpeg;
++        }
++        taskENTER_CRITICAL(&s_phone_lock);
++        s_phone_url[0] = '\0';   /* gone from that address: look it up again */
++        taskEXIT_CRITICAL(&s_phone_lock);
++        if (fresh) {
++            break;
++        }
++    }
++    *found = false;
++    *error = "the Glasses Bridge app was not found on the home network: is it open and streaming?";
++    return NULL;
++}
++#endif
++
++/* Phone first (if discovery is on), then the relay URL. */
++static uint8_t *fetch_frame(size_t *len, const char **error)
++{
++    *error = NULL;
++    uint8_t *jpeg = NULL;
++    bool found = false;
++#if CONFIG_HOMEHUB_GLASSES_DISCOVER
++    jpeg = fetch_from_phone(len, error, &found);
++#endif
++    if (!jpeg && !found && CONFIG_HOMEHUB_GLASSES_CAPTURE_URL[0]) {
++        bool unreachable;
++        jpeg = fetch(CONFIG_HOMEHUB_GLASSES_CAPTURE_URL, len, error, &unreachable);
++    }
++    if (!jpeg && !*error) {
++        *error = "no glasses source configured";
++    }
++    return jpeg;
++}
++
++/*
++ * Pre-armed capture. Each turn (wake word, tap or follow-up) starts a fetch in
++ * the background, so the frame of the moment the user spoke is already here
++ * when Muse asks for it a few seconds later, and the phone's address is
++ * looked up at boot rather than on the first question.
++ */
++#define PREFETCH_MAX_AGE_US (20 * 1000000LL)   /* a turn's frame: speech + thinking */
++#define PREFETCH_WAIT_MS 3000                  /* a capture waits this long for one in flight */
++
++static SemaphoreHandle_t s_lock;               /* guards the cached frame */
++static TaskHandle_t s_task;
++static uint8_t *s_cached;
++static size_t s_cached_len;
++static int64_t s_cached_at;
++static volatile unsigned s_wanted, s_done;  /* prefetches asked for / finished */
++
++static void prefetch_task(void *arg)
++{
++    (void)arg;
++#if CONFIG_HOMEHUB_GLASSES_DISCOVER
++    /* Find the phone as soon as there's a network, and keep trying while it isn't there. */
++    while (!s_phone_url[0]) {
++        if (wifi_mgr_is_connected() && discover_phone()) {
++            break;
++        }
++        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(30000))) {
++            xTaskNotifyGive(s_task);   /* a turn started: handle it below */
++            break;
++        }
++    }
++#endif
++    for (;;) {
++        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
++        unsigned wanted = s_wanted;
++        int64_t t0 = esp_timer_get_time();
++        size_t len = 0;
++        const char *error = NULL;
++        uint8_t *jpeg = fetch_frame(&len, &error);
++        xSemaphoreTake(s_lock, portMAX_DELAY);
++        if (jpeg) {
++            free(s_cached);
++            s_cached = jpeg;
++            s_cached_len = len;
++            s_cached_at = t0;
++        }
++        s_done = wanted;
++        xSemaphoreGive(s_lock);
++        if (jpeg) {
++            ESP_LOGI(TAG, "pre-armed %u-byte frame in %d ms", (unsigned)len, (int)((esp_timer_get_time() - t0) / 1000));
++        } else {
++            ESP_LOGI(TAG, "no frame to pre-arm: %s", error);
++        }
++    }
++}
++
++void glasses_capture_prefetch(void)
++{
++    if (!s_task) {
++        return;
++    }
++    xSemaphoreTake(s_lock, portMAX_DELAY);
++    s_wanted++;
++    xSemaphoreGive(s_lock);
++    xTaskNotifyGive(s_task);
++}
++
++void glasses_capture_start(void)
++{
++    if (s_task || !(s_lock = xSemaphoreCreateMutex())) {
++        return;
++    }
++    if (xTaskCreateWithCaps(prefetch_task, "glasses_pre", 6144, NULL, 4, &s_task,
++                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
++        s_task = NULL;
++        ESP_LOGW(TAG, "no memory for the pre-arm task: frames are fetched on request");
++        return;
++    }
++#if CONFIG_MUSE_ENABLED
++    muse_voice_set_turn_hook(glasses_capture_prefetch);
++#endif
++}
++
++/* The pre-armed frame if there is a fresh one (waiting briefly for one in flight). */
++static uint8_t *take_prefetched(size_t *len)
++{
++    if (!s_task) {
++        return NULL;
++    }
++    for (int waited = 0; waited < PREFETCH_WAIT_MS && s_done != s_wanted; waited += 50) {
++        vTaskDelay(pdMS_TO_TICKS(50));
++    }
++    uint8_t *jpeg = NULL;
++    xSemaphoreTake(s_lock, portMAX_DELAY);
++    if (s_cached && esp_timer_get_time() - s_cached_at <= PREFETCH_MAX_AGE_US) {
++        jpeg = s_cached;   /* used once: a second capture in the turn fetches anew */
++        *len = s_cached_len;
++        s_cached = NULL;
++    }
++    xSemaphoreGive(s_lock);
++    return jpeg;
++}
++
+ bool glasses_capture(char **jpeg_base64, const char **error)
+ {
+     *jpeg_base64 = NULL;
+     *error = NULL;
+     size_t len = 0;
+-    uint8_t *jpeg = fetch(&len, error);
++    uint8_t *jpeg = take_prefetched(&len);
++    bool prearmed = jpeg != NULL;
++    if (!jpeg) {
++        jpeg = fetch_frame(&len, error);
++    }
+     if (!jpeg) {
+         ESP_LOGW(TAG, "capture failed: %s", *error);
+         return false;
+@@ -116,7 +352,7 @@ bool glasses_capture(char **jpeg_base64, const char **error)
+     }
+     out[olen] = '\0';
+     free(jpeg);
+-    ESP_LOGI(TAG, "captured %u-byte frame", (unsigned)len);
++    ESP_LOGI(TAG, "captured %u-byte frame (%s)", (unsigned)len, prearmed ? "pre-armed" : "fetched now");
+     *jpeg_base64 = out;
+     return true;
+ }
+diff --git a/esp32/main/glasses_capture.h b/esp32/main/glasses_capture.h
+index 0b05bd7..649de10 100644
+--- a/esp32/main/glasses_capture.h
++++ b/esp32/main/glasses_capture.h
+@@ -18,9 +18,21 @@
+ #include <stdbool.h>
+ 
+ /*
+- * Fetches the latest Ray-Ban Meta glasses frame from a relay on the home
+- * network (CONFIG_HOMEHUB_GLASSES_CAPTURE_URL, an HTTP GET returning one JPEG)
+- * for the glasses.capture command. On success *jpeg_base64 is a heap string
+- * the caller frees; on failure *error is a static message.
++ * Fetches the latest Ray-Ban Meta glasses frame for the glasses.capture
++ * command: from the Glasses Bridge iPhone app found over mDNS
++ * (CONFIG_HOMEHUB_GLASSES_DISCOVER), else from a relay on the home network
++ * (CONFIG_HOMEHUB_GLASSES_CAPTURE_URL); either is an HTTP GET returning one
++ * JPEG. On success *jpeg_base64 is a heap string the caller frees; on failure
++ * *error is a static message.
+  */
+ bool glasses_capture(char **jpeg_base64, const char **error);
++
++/*
++ * Pre-arms capture: finds the phone as soon as Wi-Fi is up and, at the start
++ * of each voice turn, fetches a frame in the background for the
++ * glasses.capture that's likely to follow. Call once at boot.
++ */
++void glasses_capture_start(void);
++
++/* Starts a background fetch now (called at each turn's start). */
++void glasses_capture_prefetch(void);
+diff --git a/esp32/main/idf_component.yml b/esp32/main/idf_component.yml
+index c761d20..54810d1 100644
+--- a/esp32/main/idf_component.yml
++++ b/esp32/main/idf_component.yml
+@@ -16,5 +16,9 @@ dependencies:
+   espressif/esp_websocket_client: "~1.2"
+   espressif/cjson: "~1.7"
+   espressif/led_strip: "~3.0"
++  espressif/mdns:
++    version: "1.13.1"
++    rules:
++      - if: "$CONFIG{HOMEHUB_GLASSES_DISCOVER} == True"
+   idf:
+     version: ">=5.1"
+-- 
+2.53.0
+

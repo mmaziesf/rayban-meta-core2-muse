@@ -2,7 +2,8 @@
 
 Glasses Bridge is a small SwiftUI app around Meta's Wearables Device Access
 Toolkit (DAT). It registers with the Meta AI app, starts a camera stream from
-the glasses, and forwards it to the PC relay. You don't need a Mac:
+the glasses, serves the latest frame to the Core2 on your Wi-Fi, and can also
+forward the stream to the PC relay. You don't need a Mac:
 [xtool](https://github.com/xtool-org/xtool) builds, signs and installs it
 from Linux.
 
@@ -73,11 +74,39 @@ Device Management.
 
 1. **Register with Meta AI**: the app switches to Meta AI and back.
 2. **Set up the stream:**
-   - Enter the PC address (`192.168.x.x:8765`).
+   - Leave **Serve frames to Core2** on.
+   - Optionally enter a PC address (`192.168.x.x:8765`) to also stream to
+     `pc/viewer.py`. Leave it empty if there's no PC.
    - Pick a resolution (720×1280, 504×896 or 360×640) and a frame rate
      (2–30 fps). Medium at 15 fps is a good default.
    - Leave **Keep streaming when phone is locked** on: this is the HEVC mode.
-3. **Start streaming.** Meta AI asks for camera permission once.
+3. **Start streaming.** Meta AI asks for camera permission once, and iOS asks
+   for **Local Network** access: allow it, or the Core2 can't find the phone.
+   If you declined, turn it on in Settings → Privacy & Security → Local
+   Network → Glasses Bridge.
+
+## Serving frames to the Core2
+
+`SnapshotServer.swift` runs a tiny HTTP server on port **8765**:
+
+- **What it serves.** `GET /snapshot.jpg` returns the newest frame as a JPEG
+  (640 px on the long side, quality 0.7), or `503` if no frame has arrived in
+  the last 5 s.
+- **How the Core2 finds it.** The server is advertised over Bonjour as
+  `_glasses-bridge._tcp` (listed in `NSBonjourServices` in `Info.plist`).
+- **Locked phone.** While serving, every HEVC frame is decoded in software,
+  even with the phone locked: hardware decoding isn't allowed in the
+  background. The newest frame is kept as a `CIImage`, and JPEG encoding
+  happens only when the Core2 asks.
+- **The Status section** shows *Core2 server: listening on port 8765* and a
+  *Core2 frames* counter with the time and address of the last request.
+
+You can check the server from any computer on the network:
+
+```sh
+avahi-browse -rt _glasses-bridge._tcp        # or: dns-sd -B _glasses-bridge._tcp
+curl -o frame.jpg http://<phone-ip>:8765/snapshot.jpg
+```
 
 The app shows a **Problem** section with the exact DAT error. All log lines
 also go to the PC, so `pc/viewer.py` prints them.

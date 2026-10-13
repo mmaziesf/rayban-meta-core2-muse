@@ -59,10 +59,12 @@
 	<key>NSBluetoothPeripheralUsageDescription</key>
 	<string>Needed to connect to Meta AI Glasses</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Connects to your glasses over Wi-Fi and sends their camera frames to your computer on the local network.</string>
+	<string>Connects to your glasses over Wi-Fi and shares their camera frames with your Core2 and computer on the local network.</string>
+	<!-- _glasses-bridge._tcp: the snapshot server the Core2 finds (SnapshotServer.swift). -->
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_bonjour._tcp</string>
+		<string>_glasses-bridge._tcp</string>
 	</array>
 
 	<!-- Plain ws:// to a LAN address. -->

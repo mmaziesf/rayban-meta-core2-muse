@@ -5,11 +5,13 @@ import Observation
 import UIKit
 import os
 
-/// Glasses camera → JPEG → WebSocket → PC.
+/// Glasses camera → the Core2 (latest frame on request) and/or a PC (WebSocket stream).
 ///
 /// Flow: register with Meta AI once, then Start creates a DeviceSession, waits for
 /// `.started`, checks camera permission, attaches a Camera and forwards every frame
-/// the link can take to the PC viewer.
+/// the link can take to the PC viewer, if one is set. With "Serve frames to Core2"
+/// on, the newest frame is also kept for the snapshot server, which the Core2
+/// finds over Bonjour.
 @Observable
 @MainActor
 final class BridgeModel {
@@ -25,6 +27,17 @@ final class BridgeModel {
   // PC link
   private(set) var link: FrameSender.Status = .disconnected
   private(set) var isRunning = false
+
+  // Core2 (snapshot server)
+  private(set) var core2Server: SnapshotServer.Status = .stopped
+  private(set) var core2Served = 0
+  private(set) var core2LastRequest = "—"
+  var serveToCore2: Bool {
+    didSet {
+      UserDefaults.standard.set(serveToCore2, forKey: "serveToCore2")
+      updateSnapshotServer()
+    }
+  }
 
   // Last failure, kept after teardown so it stays visible.
   private(set) var lastError: String?
@@ -57,12 +70,15 @@ final class BridgeModel {
   @ObservationIgnored private var framesOut = 0
   @ObservationIgnored private var bytesOut = 0
   @ObservationIgnored private let previewDecoder = PreviewDecoder()
+  @ObservationIgnored private let latestFrame = LatestFrame()
+  @ObservationIgnored private var snapshotServer: SnapshotServer?
   @ObservationIgnored private let inForeground = OSAllocatedUnfairLock(initialState: true)
 
   init(wearables: any WearablesInterface, startupError: String?) {
     self.wearables = wearables
     self.selector = AutoDeviceSelector(wearables: wearables)
     self.host = UserDefaults.standard.string(forKey: "host") ?? ""
+    self.serveToCore2 = UserDefaults.standard.object(forKey: "serveToCore2") as? Bool ?? true
     self.sender = FrameSender(
       onStatus: { [weak self] status in
         Task { @MainActor in self?.linkChanged(status) }
@@ -71,7 +87,17 @@ final class BridgeModel {
         Task { @MainActor in self?.frameSent(bytes: bytes) }
       }
     )
+    self.snapshotServer = SnapshotServer(
+      frame: latestFrame,
+      onStatus: { [weak self] status in
+        Task { @MainActor in self?.core2ServerChanged(status) }
+      },
+      onRequest: { [weak self] served, from in
+        Task { @MainActor in self?.core2Requested(served: served, from: from) }
+      }
+    )
     if let startupError { note(startupError) }
+    updateSnapshotServer()
 
     Task { [weak self, wearables] in
       for await state in wearables.registrationStateStream() {
@@ -200,9 +226,17 @@ final class BridgeModel {
 
   func start() {
     guard !isRunning else { return }
+    // The PC is optional: with no address, frames only go to the Core2.
     let address = host.trimmingCharacters(in: .whitespaces)
-    guard let url = URL(string: "ws://\(address)/ingest"), url.host != nil else {
-      fail("invalid PC address '\(address)'; expected host:port")
+    var url: URL?
+    if !address.isEmpty {
+      guard let parsed = URL(string: "ws://\(address)/ingest"), parsed.host != nil else {
+        fail("invalid PC address '\(address)'; expected host:port")
+        return
+      }
+      url = parsed
+    } else if !serveToCore2 {
+      fail("nowhere to send frames: enter a PC address or turn on Serve frames to Core2")
       return
     }
     UserDefaults.standard.set(address, forKey: "host")
@@ -210,13 +244,17 @@ final class BridgeModel {
     preview = nil
     lastError = nil
     needsGlassesAppUpdate = false
-    sender?.connect(to: url, hello: encode(Hello(
-      device: UIDevice.current.name,
-      resolution: Self.label(for: resolution),
-      fps: frameRate,
-      codec: keepStreamingWhenLocked ? "hevc" : "jpeg"
-    )))
-    note("connecting to \(url.absoluteString)")
+    if let url {
+      sender?.connect(to: url, hello: encode(Hello(
+        device: UIDevice.current.name,
+        resolution: Self.label(for: resolution),
+        fps: frameRate,
+        codec: keepStreamingWhenLocked ? "hevc" : "jpeg"
+      )))
+      note("connecting to \(url.absoluteString)")
+    } else {
+      note("no PC address: serving frames to the Core2 only")
+    }
     watchDevice(selector.activeDevice)
 
     do throws(DeviceSessionError) {
@@ -289,6 +327,7 @@ final class BridgeModel {
   private func observe(_ stream: MWDATCamera.Stream) {
     guard let sender else { return }
     let quality = CGFloat(jpegQuality)
+    let latest: LatestFrame? = serveToCore2 ? latestFrame : nil
 
     stream.statePublisher.listen { [weak self] state in
       Task { @MainActor in self?.streamChanged(state) }
@@ -297,7 +336,9 @@ final class BridgeModel {
       Task { @MainActor in self?.fail("stream error: \(error.description)") }
     }.store(in: streamTokens)
     if stream.streamConfiguration.videoCodec == .hvc1 {
-      // Compressed frames go to the PC as-is; the preview is decoded only while visible.
+      // Compressed frames go to the PC as-is. They're decoded for the preview
+      // while visible, and always while serving the Core2, which needs the
+      // newest frame even with the phone locked.
       let decoder = previewDecoder
       let inForeground = inForeground
       let frameCount = OSAllocatedUnfairLock(initialState: 0)
@@ -305,12 +346,14 @@ final class BridgeModel {
         guard let packet = HEVCPacketizer.annexB(from: frame.sampleBuffer) else { return }
         sender.send(video: packet.data, isKeyframe: packet.isKeyframe)
         var preview: UIImage?
-        if inForeground.withLock({ $0 }) {
+        let visible = inForeground.withLock { $0 }
+        if visible || latest != nil {
           let count = frameCount.withLock { n in
             n += 1
             return n
           }
-          preview = decoder.decode(frame.sampleBuffer, isKeyframe: packet.isKeyframe, wantImage: count % 3 == 0)
+          preview = decoder.decode(
+            frame.sampleBuffer, isKeyframe: packet.isKeyframe, wantImage: visible && count % 3 == 0, latest: latest)
         }
         Task { @MainActor in self?.frameReceived(preview) }
       }.store(in: streamTokens)
@@ -319,6 +362,7 @@ final class BridgeModel {
     stream.videoFramePublisher.listen { [weak self] frame in
       // Off the main actor: encode only when the link can take the frame.
       guard let image = frame.makeUIImage() else { return }
+      if let cgImage = image.cgImage { latest?.update(cgImage) }
       if sender.isReady, let jpeg = image.jpegData(compressionQuality: quality) {
         sender.send(jpeg: jpeg)
       }
@@ -343,7 +387,34 @@ final class BridgeModel {
     sessionState = .idle
     streamState = .stopped
     sender?.disconnect()
+    latestFrame.clear()
+    previewDecoder.reset()
     isRunning = false
+  }
+
+  // MARK: Core2
+
+  private func updateSnapshotServer() {
+    if serveToCore2 {
+      snapshotServer?.start(name: "Glasses Bridge (\(UIDevice.current.name))")
+    } else {
+      snapshotServer?.stop()
+    }
+  }
+
+  private func core2ServerChanged(_ status: SnapshotServer.Status) {
+    core2Server = status
+    switch status {
+    case .listening(let port): note("serving frames to the Core2 on port \(port) (Bonjour \(SnapshotServer.serviceType))")
+    case .failed(let reason): fail("Core2 server failed: \(reason)")
+    case .stopped: note("Core2 server stopped")
+    }
+  }
+
+  private func core2Requested(served: Bool, from: String) {
+    core2LastRequest = "\(Self.clock.string(from: Date())) from \(from)\(served ? "" : " (no recent frame)")"
+    if served { core2Served += 1 }
+    note(served ? "frame sent to \(from)" : "\(from) asked for a frame, but none is recent")
   }
 
   // MARK: Link and stats
@@ -376,7 +447,8 @@ final class BridgeModel {
 
   private func appVisibilityChanged(visible: Bool) {
     inForeground.withLock { $0 = visible }
-    if !visible { previewDecoder.reset() }
+    // While serving the Core2 every frame is still decoded, so there's no gap to recover from.
+    if !visible && !serveToCore2 { previewDecoder.reset() }
     guard isRunning else { return }
     if keepStreamingWhenLocked {
       note(visible ? "app visible" : "app in background: HEVC stream continues")

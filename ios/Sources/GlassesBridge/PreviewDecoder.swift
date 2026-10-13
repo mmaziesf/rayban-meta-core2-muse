@@ -4,9 +4,10 @@ import UIKit
 import VideoToolbox
 import os
 
-/// Decodes `.hvc1` frames for the on-phone preview only (the PC gets the
-/// compressed stream). Mirrors the CameraAccess sample's VideoFrameDecoder:
-/// software decode, restart on format change, wait for a keyframe after a reset.
+/// Decodes `.hvc1` frames for the on-phone preview and for the Core2 (the PC
+/// gets the compressed stream). Mirrors the CameraAccess sample's
+/// VideoFrameDecoder: software decode (hardware decoding isn't allowed in the
+/// background), restart on format change, wait for a keyframe after a reset.
 final class PreviewDecoder: Sendable {
   private struct State {
     var session: VTDecompressionSession?
@@ -22,9 +23,10 @@ final class PreviewDecoder: Sendable {
     state.withLockUnchecked { $0.awaitingKeyframe = true }
   }
 
-  /// Every frame must be decoded (HEVC frames reference earlier ones); only
-  /// frames with `wantImage` are converted to a UIImage.
-  func decode(_ sampleBuffer: CMSampleBuffer, isKeyframe: Bool, wantImage: Bool) -> UIImage? {
+  /// Every frame must be decoded (HEVC frames reference earlier ones); each
+  /// decoded frame goes to `latest` if given, and only frames with `wantImage`
+  /// are converted to a UIImage.
+  func decode(_ sampleBuffer: CMSampleBuffer, isKeyframe: Bool, wantImage: Bool, latest: LatestFrame? = nil) -> UIImage? {
     guard let format = CMSampleBufferGetFormatDescription(sampleBuffer) else { return nil }
 
     let session: VTDecompressionSession? = state.withLockUnchecked { s in
@@ -66,6 +68,7 @@ final class PreviewDecoder: Sendable {
       state.withLockUnchecked { $0.awaitingKeyframe = true }
       return nil
     }
+    latest?.update(pixelBuffer)
     guard wantImage else { return nil }
     let image = CIImage(cvPixelBuffer: pixelBuffer)
     guard let cgImage = context.createCGImage(image, from: image.extent) else { return nil }

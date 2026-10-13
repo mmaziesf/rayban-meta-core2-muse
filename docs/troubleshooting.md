@@ -30,6 +30,20 @@ Every problem below actually happened while building this project.
 | `/dev/ttyACM0` permission denied | `sudo usermod -aG dialout $USER` and log in again (or `sg dialout -c "…"` for now) |
 | The Muse firmware says the Core2 isn't supported, or the screen stays dark | It's a v1.1: build the `core2v11` profile (this repo's patches), not `core2` |
 | `glasses.capture` fails with "not streaming" | The relay hasn't had a frame in 5 s; start the stream in the app |
-| `glasses.capture` fails with "not reachable" | `GLASSES_RELAY_URL` is wrong, or a firewall blocks port 8765 |
+| `glasses.capture` fails with "not reachable" | No phone was found and `GLASSES_RELAY_URL` is wrong, or a firewall blocks port 8765 |
 | The standalone firmware shows nothing | Frames over 15 KB get dropped; the relay keeps them under 14 KB. Check `RELAY_HOST` in `secrets.h` |
 | The Core2 can't join Wi-Fi | It's 2.4 GHz only; check the router broadcasts 2.4 GHz |
+| Log says `no Glasses Bridge app found on the network` | The app isn't open, or iOS **Local Network** access is off for it (Settings → Privacy & Security → Local Network). Check with `avahi-browse -rt _glasses-bridge._tcp`. Phone and Core2 must be on the same network, with no client isolation |
+| The Core2 acts by itself (talk button presses, test MP3s) while a log reader is open | The serial port has echo on: the log is echoed back into the console, which takes letters as bench commands. Use `stty -F /dev/ttyACM0 raw -echo` (or a raw-mode reader) |
+
+## Voice
+
+| Symptom | Fix |
+|---|---|
+| "voice pipeline unavailable" after enabling the wake word | Internal RAM is exhausted: the wake word's tensor arena must be in PSRAM (patch 0003 does this) |
+| One "Hey Jarvis" triggers several turns | The streaming model's state must be reset at every turn (patch 0003 does this) |
+| Replies sound metallic or robotic | Serve 16 kHz audio (the Core2's resampler has no anti-aliasing); `speech_server.py` does by default |
+| Replies too quiet | Raise `--loudness` (default −12 dBFS RMS, with a limiter). The Core2's volume setting doesn't scale the speech |
+| Muse receives "You" or "Thank you" when nobody spoke | Whisper inventing words for noise; `speech_server.py` drops low-confidence segments and these phantom phrases |
+| A turn ends right after "Hey Jarvis" | Expected only if nothing follows: a transcript that is just the wake word reads as unfinished, so the Core2 waits up to 1.5 s for the question |
+| `speech server unreachable` in the log | Check `TTS_URL`/`STT_URL`, that the server runs (`curl <host>/health`) and, for a cloud server, that `SPEECH_TOKEN` matches (the server logs `refused, no valid token`) |

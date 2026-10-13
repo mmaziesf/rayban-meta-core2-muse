@@ -1,13 +1,33 @@
 # Architecture and data flow
 
-## Why there's a phone and a PC in the middle
+## Without a PC
+
+The Core2 can run with no computer at home:
+
+```
+ Ray-Ban Meta ──DAT──▶ iPhone: Glasses Bridge ◀── GET /snapshot.jpg ── Core2 (Muse gadget)
+                       · decodes every frame       (found over mDNS:      │  ▲
+                       · serves the newest         _glasses-bridge._tcp)  │  │ Noise session
+                                                                          │  ▼
+                                    speech server (cloud, HTTPS) ◀──/stt, /tts──  Muse (cloud)
+```
+
+- **Glasses frames** come straight from the phone: see patch 4 in
+  [core2-muse-gadget.md](core2-muse-gadget.md) and the app's snapshot
+  server in [ios-app.md](ios-app.md).
+- **Speech** comes from `pc/speech_server.py`, on any host: see
+  [voice.md](voice.md).
+- **The PC relay** below is still useful for watching the stream, recording
+  it, the Muse Spark agent and meal logging.
+
+## Why there's a phone (and optionally a PC) in the middle
 
 - **The glasses** only share their camera with phone apps, through Meta's
   Wearables Device Access Toolkit (DAT). The link between glasses and phone
   is proprietary and encrypted, so an ESP32 can't join it.
 - **The ESP32 in the Core2** has 2.4 GHz Wi-Fi only and no hardware video
   decoder, so it can't decode the glasses' HEVC stream itself.
-- **The PC** decodes the stream, keeps the latest frame, and serves it to the
+- **The PC** (or, without one, the phone itself) decodes the stream, keeps the latest frame, and serves it to the
   Core2 and to agents.
 
 ## Components
@@ -50,11 +70,17 @@ behind, it skips to the next keyframe rather than sending broken
 references. In JPEG mode at most one frame is in flight, and newer frames
 replace older ones.
 
-### PC → Muse gadget (`GET http://<pc>:8765/snapshot.jpg`)
+### Phone or PC → Muse gadget (`GET http://<phone or pc>:8765/snapshot.jpg`)
+
+The iPhone app and `pc/viewer.py` serve the same endpoint:
 
 - Returns the latest frame scaled to 640 px on the long side, as
   `image/jpeg` with `Content-Length`.
 - Returns `503` when no frame has arrived in the last 5 seconds.
+
+The gadget tries the phone first (found over mDNS), then the PC URL if one is
+configured. It fetches a frame when each voice turn starts, so the frame is
+ready before Muse asks for it.
 
 The gadget's `glasses.capture` command fetches it, base64-encodes it, and
 returns `{"format":"jpeg-base64","source":"meta-ray-ban-glasses","data_base64":…}`:

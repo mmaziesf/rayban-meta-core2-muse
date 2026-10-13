@@ -1,7 +1,7 @@
 From 0e6847eeb3bff365bb5e44754eed17388cb1f7ee Mon Sep 17 00:00:00 2001
 From: Milad <mmaziesf@uwaterloo.ca>
 Date: Mon, 12 Oct 2026 12:59:22 -0700
-Subject: [PATCH 2/2] Add glasses.capture: Ray-Ban Meta frames from a home
+Subject: [PATCH 2/4] Add glasses.capture: Ray-Ban Meta frames from a home
  relay
 
 Muse can ask the gadget for the latest frame from the user's Meta Ray-Ban

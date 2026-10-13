@@ -1,7 +1,7 @@
 From 0fb388239b1af590d12aae1a9e34f79c1c576edc Mon Sep 17 00:00:00 2001
 From: Milad <mmaziesf@uwaterloo.ca>
 Date: Mon, 12 Oct 2026 12:56:21 -0700
-Subject: [PATCH 1/2] Support the M5Stack Core2 v1.1 (AXP2101 PMU)
+Subject: [PATCH 1/4] Support the M5Stack Core2 v1.1 (AXP2101 PMU)
 
 The Core2 v1.1 replaces the v1.0's AXP192 with an AXP2101 at the same I2C
 address but a different register map, so the v1.0 build must not run on it.

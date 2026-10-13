@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Builds (and optionally flashes) the Muse gadget firmware for an M5Stack
-# Core2 v1.1, putting the SDK token and glasses relay URL from .env into the
-# build's sdkconfig without printing them.
+# Core2 v1.1, putting the SDK token, speech server URLs and token, and the
+# optional glasses relay URL from .env into the build's sdkconfig (git-ignored)
+# without printing them.
 #
 #   muse-gadget/build.sh [SDK_DIR] [flash]
 #
-# .env (repo root): GADGET_SDK_TOKEN=mgst_...   GLASSES_RELAY_URL=http://<pc>:8765/snapshot.jpg
+# .env (repo root): GADGET_SDK_TOKEN=mgst_...  TTS_URL=  STT_URL=  [SPEECH_TOKEN=]
+#                   [GLASSES_RELAY_URL=http://<pc>:8765/snapshot.jpg]
 # ESP-IDF v6.0.1: set IDF_EXPORT=/path/to/esp-idf/export.sh if it isn't in
 # ~/esp/esp-idf-v6.0.1 or ~/.espressif/esp-idf-v6.0.1.
 set -euo pipefail
@@ -43,16 +45,33 @@ try:
             env[key.strip()] = value.strip().strip('"').strip("'")
 except FileNotFoundError:
     sys.exit(f"{env_path} not found: copy .env.example to .env and fill it in")
-token, url = env.get("GADGET_SDK_TOKEN", ""), env.get("GLASSES_RELAY_URL", "")
-if not re.fullmatch(r"mgst_[A-Za-z0-9_\-]+", token):
-    sys.exit("GADGET_SDK_TOKEN in .env is missing or not an mgst_ token")
-if not re.fullmatch(r"http://[^\s\"]+", url):
-    sys.exit("GLASSES_RELAY_URL in .env is missing (http://<pc>:8765/snapshot.jpg)")
+def need(key, pattern, hint, optional=False):
+    value = env.get(key, "")
+    if not value and optional:
+        return ""
+    if not re.fullmatch(pattern, value):
+        sys.exit(f"{key} in .env is missing or malformed ({hint})")
+    return value
+url_re = r"https?://[^\s\"]+"
+values = {
+    "CONFIG_GADGET_SDK_TOKEN": need("GADGET_SDK_TOKEN", r"mgst_[A-Za-z0-9_\-]+", "an mgst_ token"),
+    "CONFIG_MUSE_TTS_URL": need("TTS_URL", url_re, "http(s)://<speech server>/tts"),
+    "CONFIG_MUSE_STT_URL": need("STT_URL", url_re, "http(s)://<speech server>/stt"),
+    "CONFIG_MUSE_SPEECH_TOKEN": need("SPEECH_TOKEN", r"[A-Za-z0-9._~+/=\-]+", "letters, digits, ._~+/=-", True),
+    # Empty: frames come only from the iPhone app, found over mDNS.
+    "CONFIG_HOMEHUB_GLASSES_CAPTURE_URL": need("GLASSES_RELAY_URL", url_re, "http://<pc>:8765/snapshot.jpg", True),
+}
+if values["CONFIG_MUSE_SPEECH_TOKEN"] and not (values["CONFIG_MUSE_TTS_URL"].startswith("https://")
+                                               and values["CONFIG_MUSE_STT_URL"].startswith("https://")):
+    print("warning: SPEECH_TOKEN over plain http:// is readable on the network; use https:// URLs", file=sys.stderr)
 cfg = open(cfg_path).read()
-cfg = re.sub(r'^CONFIG_GADGET_SDK_TOKEN=.*$', f'CONFIG_GADGET_SDK_TOKEN="{token}"', cfg, flags=re.M)
-cfg = re.sub(r'^CONFIG_HOMEHUB_GLASSES_CAPTURE_URL=.*$', f'CONFIG_HOMEHUB_GLASSES_CAPTURE_URL="{url}"', cfg, flags=re.M)
+for key, value in values.items():
+    line = f'{key}="{value}"'
+    cfg, n = re.subn(rf"^{key}=.*$", lambda _: line, cfg, flags=re.M)
+    if not n:
+        cfg += line + "\n"
 open(cfg_path, "w").write(cfg)
-print("sdkconfig: SDK token and glasses relay URL set")
+print("sdkconfig: SDK token, speech server and glasses settings set")
 EOF
 
 tools/muse/board.sh build core2v11

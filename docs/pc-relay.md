@@ -1,5 +1,10 @@
 # PC relay and agent
 
+The relay is optional now: the Core2 can get glasses frames straight from the
+iPhone app. Use it to watch or record the stream, for the vision agent and
+for meal logging. The Core2's voice comes from a different script,
+`pc/speech_server.py` (port 8766), described in [voice.md](voice.md).
+
 `pc/viewer.py` is a single [uv](https://docs.astral.sh/uv/) script. Its
 dependencies are declared inline, so this is all you need:
 

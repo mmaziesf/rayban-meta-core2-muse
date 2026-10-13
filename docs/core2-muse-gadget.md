@@ -2,8 +2,15 @@
 
 Meta's [Muse Gadget SDK](https://github.com/facebookincubator/muse-gadget-sdk)
 turns an ESP32 board into a Muse device: the Jollybot avatar UI,
-push-to-talk voice notes, and commands Muse can call. This repo adds two
-patches on top of upstream commit `812c46f` (2026-10-09).
+push-to-talk voice notes, and commands Muse can call. This repo adds four
+patches on top of upstream commit `812c46f` (2026-10-09):
+
+| Patch | Adds |
+|---|---|
+| `0001` | Core2 **v1.1** (AXP2101) support |
+| `0002` | `glasses.capture`: Muse can see the latest glasses frame |
+| `0003` | Voice: "Hey Jarvis" wake word, spoken replies, transcription on your speech server, hands-free turns (see [voice.md](voice.md)) |
+| `0004` | Glasses frames straight from the iPhone app (no PC), fetched ahead of Muse's request |
 
 ## Patch 1: Core2 v1.1 support
 
@@ -55,6 +62,31 @@ A new command, `glasses.capture`, behind the option
 - **Errors:** if the relay is unreachable or the glasses aren't streaming,
   Muse gets a clear error, for example "the glasses are not streaming".
 
+## Patch 3: voice
+
+Wake word, speech server, end-of-speech detection and kept connections are
+described in [voice.md](voice.md).
+
+## Patch 4: frames from the phone, pre-armed
+
+- **No PC needed.** With `CONFIG_HOMEHUB_GLASSES_DISCOVER`, the Core2 gets
+  frames from the **Glasses Bridge app** itself. The app serves
+  `GET /snapshot.jpg` on port 8765 and advertises `_glasses-bridge._tcp`
+  over Bonjour.
+- **Finding the phone.** The Core2 looks it up with mDNS (the
+  `espressif/mdns` component: a PTR query, then SRV, then A when the answer
+  carries no address). It does this as soon as Wi-Fi is up, then every 30 s
+  until found, and again whenever the phone stops answering. If the phone
+  can't be found, it uses `CONFIG_HOMEHUB_GLASSES_CAPTURE_URL`; leave that
+  empty to use the phone only.
+- **Pre-armed.** Each voice turn fetches a frame in the background the
+  moment it starts (wake word or tap). When Muse calls `glasses.capture` a
+  few seconds later, the frame of the moment you asked is already in memory.
+  A capture waits up to 3 s for a fetch in flight, uses a frame only if it's
+  under 20 s old and only once, and otherwise fetches live.
+- **The hook.** `muse_voice_set_turn_hook()` (patch 3) lets the app act at
+  the start of each turn.
+
 ## Build and flash
 
 You need **ESP-IDF v6.0.1** exactly (the SDK says so):
@@ -68,13 +100,14 @@ Then, from this repo:
 
 ```sh
 muse-gadget/setup.sh                 # clone the SDK at 812c46f and apply the patches (branch core2-v1.1)
-muse-gadget/build.sh                 # build; reads GADGET_SDK_TOKEN and GLASSES_RELAY_URL from .env
+muse-gadget/build.sh                 # build; reads GADGET_SDK_TOKEN, TTS_URL, STT_URL, SPEECH_TOKEN, GLASSES_RELAY_URL from .env
 muse-gadget/build.sh "" flash        # build and flash (port found by USB ID: CH9102 or CP2104)
 ```
 
 The SDK token comes from gadgets.muse.ai → Account → SDK tokens. The script
-writes it and the relay URL into the git-ignored build directory's
-`sdkconfig`, never into source.
+writes it, the speech server settings and the relay URL into the git-ignored
+build directory's `sdkconfig`, never into source. Start the speech server
+(`pc/speech_server.py`, see [voice.md](voice.md)) before talking to the Core2.
 
 **First flash:** back up the Core2 first (`scripts/backup_core2.sh`). Erase
 the flash so old firmware data doesn't sit where Muse keeps its settings:
@@ -93,12 +126,16 @@ is normal on the classic ESP32.
 1. **Pair.** In the Muse app: Settings → Devices → **Developer mode** on →
    **+** → `MuseGadget-XXXXXX`, then enter your Wi-Fi (2.4 GHz). Confirm by
    tapping the touch strip under the screen.
-2. **Ask.** **Hold the middle of the touch strip** (BtnB), speak, release.
-   Replies appear as captions.
+2. **Ask.** Say **"Hey Jarvis"**, then your question, and stop talking: the
+   Core2 notices, says a short filler and then speaks Muse's reply, with
+   captions. A tap on the middle of the touch strip (BtnB) also starts a
+   turn; holding it works as push-to-talk.
 3. **Power button.** A tap sleeps or wakes the screen. Holding it shuts down
    cleanly; the PMU forces power off at about 4 s.
-4. **Glasses.** Start streaming in Glasses Bridge, then ask "What am I looking
-   at?". The relay prints `[snapshot] served … bytes to <core2 ip>`.
+4. **Glasses.** Start streaming in Glasses Bridge (allow **Local Network**
+   when iOS asks), then say "Hey Jarvis, what am I looking at?". The app's
+   *Core2 frames* counter goes up. The Core2 logs `pre-armed … frame` and
+   `captured … (pre-armed)`.
 
 ## Running the SDK tests
 

@@ -34,7 +34,7 @@ assistant:
 | `GET /health` | | `ok` (no token needed) |
 
 ```sh
-pc/speech_server.py                          # defaults: --voice af_bella --pitch 4 --tempo 1.05 --loudness -12
+pc/speech_server.py                          # defaults: --voice af_bella --pitch 4 --tempo 1.05 --loudness -9
 SPEECH_TOKEN=... pc/speech_server.py         # require "Authorization: Bearer <token>"
 ```
 
@@ -51,7 +51,7 @@ shift. It's tuned for the Core2's small speaker:
   resampler is linear with no anti-aliasing, and 24 kHz audio came out
   metallic through it.
 - **Loud and clear.** A 180 Hz high-pass (the speaker can't reproduce
-  lower), a +2 dB lift at 2.5 kHz, and levelling to −12 dBFS under a soft
+  lower), a +2 dB lift at 2.5 kHz, and levelling to −9 dBFS under a soft
   limiter. Each sentence's peaks are capped, so nothing clips.
 
 **Transcription.** Far-field speech arrives quiet (−35 to −45 dBFS), so it

@@ -11,7 +11,7 @@
 Transcribing on the PC (Whisper, warm) and sending Muse text is faster than
 sending a voice note for Muse to transcribe.
 
-  pc/speech_server.py [--port 8766] [--voice af_bella] [--pitch 4] [--tempo 1.05] [--loudness -12] [--flat]
+  pc/speech_server.py [--port 8766] [--voice af_bella] [--pitch 4] [--tempo 1.05] [--loudness -9] [--flat]
   GET  /health -> "ok" (for a cloud host's health check; no token needed)
 
 With --token (or SPEECH_TOKEN in the environment), /stt and /tts answer only
@@ -133,7 +133,7 @@ def speakable(text: str) -> list[str]:
 
 
 class Speaker:
-    def __init__(self, models: Path, voice: str, speed: float, loudness: float = -12.0, flat: bool = False,
+    def __init__(self, models: Path, voice: str, speed: float, loudness: float = -9.0, flat: bool = False,
                  pitch: float = 0.0) -> None:
         self.pitch = pitch
         self.loudness = loudness
@@ -324,7 +324,8 @@ def main() -> None:
     ap.add_argument("--pitch", type=float, default=4.0, help="semitones up (toy/cartoon character)")
     ap.add_argument("--tempo", "--speed", dest="speed", type=float, default=1.05, help="final speaking speed")
     ap.add_argument("--models", type=Path, default=Path.home() / ".local/share/kokoro")
-    ap.add_argument("--loudness", type=float, default=-12.0, help="target speech level, dBFS RMS")
+    ap.add_argument("--loudness", type=float, default=-9.0,
+                    help="target speech level, dBFS RMS (-9: loudest that stays clear on the Core2)")
     ap.add_argument("--flat", action="store_true", help="no speaker EQ or levelling")
     ap.add_argument("--whisper", default="base.en", help="faster-whisper model for /stt")
     ap.add_argument("--token", default=os.environ.get("SPEECH_TOKEN", ""),

@@ -43,7 +43,7 @@ Every problem below actually happened while building this project.
 | "voice pipeline unavailable" after enabling the wake word | Internal RAM is exhausted: the wake word's tensor arena must be in PSRAM (patch 0003 does this) |
 | One "Hey Jarvis" triggers several turns | The streaming model's state must be reset at every turn (patch 0003 does this) |
 | Replies sound metallic or robotic | Serve 16 kHz audio (the Core2's resampler has no anti-aliasing); `speech_server.py` does by default |
-| Replies too quiet | Raise `--loudness` (default −12 dBFS RMS, with a limiter). The Core2's volume setting doesn't scale the speech |
+| Replies too quiet | `--loudness` (default −9 dBFS RMS, with a limiter) is the loudest that stays clear on the Core2: at −6 and −3 the limiter and its small speaker cost words. Beyond that, put the Core2 closer to the listener. The Core2's volume setting doesn't scale the speech |
 | Muse receives "You" or "Thank you" when nobody spoke | Whisper inventing words for noise; `speech_server.py` drops low-confidence segments and these phantom phrases |
 | A turn ends right after "Hey Jarvis" | Expected only if nothing follows: a transcript that is just the wake word reads as unfinished, so the Core2 waits up to 1.5 s for the question |
 | `speech server unreachable` in the log | Check `TTS_URL`/`STT_URL`, that the server runs (`curl <host>/health`) and, for a cloud server, that `SPEECH_TOKEN` matches (the server logs `refused, no valid token`) |

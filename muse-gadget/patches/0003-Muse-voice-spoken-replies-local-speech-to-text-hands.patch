@@ -1,6 +1,6 @@
-From 4df351107c35722cb47a3a11229e6076bf73c426 Mon Sep 17 00:00:00 2001
+From b3d85f0f03beacc85d48f19258527bd1b90416db Mon Sep 17 00:00:00 2001
 From: Milad <mmaziesf@uwaterloo.ca>
-Date: Mon, 12 Oct 2026 23:03:15 -0700
+Date: Mon, 12 Oct 2026 23:44:57 -0700
 Subject: [PATCH 3/4] Muse voice: spoken replies, local speech-to-text,
  hands-free turns, wake word
 
@@ -43,6 +43,10 @@ the Core2 v1.1 profile turns it on.
   bundle, TLS sessions are resumed (session tickets), and
   MUSE_SPEECH_TOKEN is sent as a bearer token.
 - muse_voice_set_turn_hook lets the app act as each turn starts.
+- The Core2 profile's MUSE_VOICE_NOTE_HINT also asks Muse to call
+  glasses.capture again for every question about what the user sees: after
+  one capture failed, Muse otherwise kept answering "your glasses aren't
+  streaming" without calling it (0 of 10 visual prompts in a test).
 ---
  esp32/components/microfrontend/CMakeLists.txt |  22 +
  esp32/components/microfrontend/README.md      |   7 +
@@ -5284,7 +5288,7 @@ literal 0
 HcmV?d00001
 
 diff --git a/esp32/devices/sdkconfig.muse-m5stack-core2-v11 b/esp32/devices/sdkconfig.muse-m5stack-core2-v11
-index 0e0c02a..5a141ab 100644
+index 0e0c02a..b0a24f4 100644
 --- a/esp32/devices/sdkconfig.muse-m5stack-core2-v11
 +++ b/esp32/devices/sdkconfig.muse-m5stack-core2-v11
 @@ -54,3 +54,22 @@ CONFIG_BSP_PMU_AXP2101=y
@@ -5306,7 +5310,7 @@ index 0e0c02a..5a141ab 100644
 +CONFIG_MUSE_FOLLOW_UP_S=0
 +# On-device wake word ("Hey Jarvis", microWakeWord on TensorFlow Lite Micro).
 +CONFIG_MUSE_WAKE_WORD=y
-+CONFIG_MUSE_VOICE_NOTE_HINT="Voice chat from my desk gadget: reply warmly and naturally in one to three short spoken sentences, with no lists, markdown, emoji or links, since it will be read aloud."
++CONFIG_MUSE_VOICE_NOTE_HINT="Voice chat from my desk gadget: reply warmly and naturally in one to three short spoken sentences, with no lists, markdown, emoji or links, since it will be read aloud. For anything about what I see, call glasses.capture again every time, even if it failed before."
 +
 +# Resume TLS sessions to the speech server when a kept connection has closed.
 +CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS=y

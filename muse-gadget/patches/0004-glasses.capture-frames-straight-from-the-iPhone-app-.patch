@@ -1,6 +1,6 @@
-From 9f7b282646f4cca17b18ae01b6db718863739ddc Mon Sep 17 00:00:00 2001
+From f0f2a70f1db979d0f5a4f478fd3bb403158e1243 Mon Sep 17 00:00:00 2001
 From: Milad <mmaziesf@uwaterloo.ca>
-Date: Mon, 12 Oct 2026 23:03:15 -0700
+Date: Mon, 12 Oct 2026 23:44:57 -0700
 Subject: [PATCH 4/4] glasses.capture: frames straight from the iPhone app,
  pre-armed per turn
 

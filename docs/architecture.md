@@ -83,9 +83,11 @@ configured. It fetches a frame when each voice turn starts, so the frame is
 ready before Muse asks for it.
 
 The gadget's `glasses.capture` command fetches it, base64-encodes it, and
-returns `{"format":"jpeg-base64","source":"meta-ray-ban-glasses","data_base64":…}`:
-the same result shape as the SDK's `camera.capture`. Muse decides when to
-call it, based on the command description.
+returns `{"description":…,"format":"jpeg-base64","data_base64":…}`: the SDK's
+`camera.capture` shape plus `description`. Muse doesn't look at the image
+itself, so `description` comes from the speech server's `/vision`, a vision
+model (see [voice.md](voice.md)). Muse decides when to call the command,
+based on its description.
 
 ### PC ↔ standalone Core2 (`ws://<pc>:8765/core2`)
 

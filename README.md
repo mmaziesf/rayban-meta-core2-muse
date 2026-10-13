@@ -55,7 +55,7 @@ The phone and the Core2 must share a Wi-Fi network (2.4 GHz for the Core2).
 
 ```sh
 git clone https://github.com/<you>/rayban-meta-core2-muse && cd rayban-meta-core2-muse
-cp .env.example .env            # fill in GADGET_SDK_TOKEN, TTS_URL, STT_URL (and MODEL_API_KEY for the PC agent)
+cp .env.example .env            # fill in GADGET_SDK_TOKEN, TTS_URL, STT_URL, MODEL_API_KEY
 
 # 1. Back up the Core2 first (all 16 MB); restore any time with scripts/restore_core2.sh
 scripts/backup_core2.sh /dev/ttyACM0
@@ -83,7 +83,8 @@ Jarvis, what am I looking at?"**.
 
 Nothing secret is committed. All credentials live in `.env` (git-ignored):
 
-- `MODEL_API_KEY`: Meta Model API key, used only by the PC agent.
+- `MODEL_API_KEY`: Meta Model API key, used by the PC agent and by the speech
+  server's `/vision`. It stays on the server and is never put in the firmware.
 - `GADGET_SDK_TOKEN`: Muse Gadget SDK token. `muse-gadget/build.sh` writes it
   into the git-ignored build directory, never into source. It ships inside the
   firmware, so treat it as an identifier: revoke and regenerate it on
@@ -106,6 +107,9 @@ Nothing secret is committed. All credentials live in `.env` (git-ignored):
 - **Free Apple ID:** the app expires after 7 days; rerun `ios/install.sh`.
 - **The wake word is "Hey Jarvis"**, a pre-trained open model. A custom one
   ("Hey Muse") would need training with microWakeWord.
+- **Muse doesn't look at images from gadget commands**, only text. So the
+  speech server describes each glasses frame with Muse Spark's vision model
+  (`MODEL_API_KEY`), and the Core2 passes that description to Muse.
 - **Muse's thinking time** (1.5–6 s to start replying) is now most of the
   wait; the gadget's own part is about 1 s ([voice.md](docs/voice.md)).
 - **xtool on Linux:** it extracts the iOS SDK from your own `Xcode.xip`.

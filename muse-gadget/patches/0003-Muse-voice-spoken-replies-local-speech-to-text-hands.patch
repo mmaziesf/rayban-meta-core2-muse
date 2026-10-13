@@ -1,6 +1,6 @@
-From afc1a90880edea2625e4620ef9e183e563a6d0e0 Mon Sep 17 00:00:00 2001
+From 4df351107c35722cb47a3a11229e6076bf73c426 Mon Sep 17 00:00:00 2001
 From: Milad <mmaziesf@uwaterloo.ca>
-Date: Mon, 12 Oct 2026 21:48:57 -0700
+Date: Mon, 12 Oct 2026 23:03:15 -0700
 Subject: [PATCH 3/4] Muse voice: spoken replies, local speech-to-text,
  hands-free turns, wake word
 

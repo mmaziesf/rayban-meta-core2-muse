@@ -72,6 +72,8 @@ final class BridgeModel {
   @ObservationIgnored private let previewDecoder = PreviewDecoder()
   @ObservationIgnored private let latestFrame = LatestFrame()
   @ObservationIgnored private var snapshotServer: SnapshotServer?
+  @ObservationIgnored private var serverRetry: Task<Void, Never>?
+  @ObservationIgnored private var serverRetryDelay: Double = 2
   @ObservationIgnored private let inForeground = OSAllocatedUnfairLock(initialState: true)
 
   init(wearables: any WearablesInterface, startupError: String?) {
@@ -240,6 +242,7 @@ final class BridgeModel {
       return
     }
     UserDefaults.standard.set(address, forKey: "host")
+    ensureSnapshotServer()
     isRunning = true
     preview = nil
     lastError = nil
@@ -395,6 +398,8 @@ final class BridgeModel {
   // MARK: Core2
 
   private func updateSnapshotServer() {
+    serverRetry?.cancel()
+    serverRetry = nil
     if serveToCore2 {
       snapshotServer?.start(name: "Glasses Bridge (\(UIDevice.current.name))")
     } else {
@@ -402,12 +407,32 @@ final class BridgeModel {
     }
   }
 
+  /// Restarts the server if it should be running and isn't (it can fail, e.g.
+  /// when iOS resets the app's Bonjour connection around the Local Network prompt).
+  private func ensureSnapshotServer() {
+    guard serveToCore2, snapshotServer?.isListening == false, serverRetry == nil else { return }
+    updateSnapshotServer()
+  }
+
   private func core2ServerChanged(_ status: SnapshotServer.Status) {
     core2Server = status
     switch status {
-    case .listening(let port): note("serving frames to the Core2 on port \(port) (Bonjour \(SnapshotServer.serviceType))")
-    case .failed(let reason): fail("Core2 server failed: \(reason)")
-    case .stopped: note("Core2 server stopped")
+    case .listening(let port):
+      serverRetryDelay = 2
+      note("serving frames to the Core2 on port \(port) (Bonjour \(SnapshotServer.serviceType))")
+    case .failed(let reason):
+      // Try again, backing off to once a minute; Start and returning to the app also retry.
+      let delay = serverRetryDelay
+      serverRetryDelay = min(serverRetryDelay * 2, 60)
+      note("Core2 server failed: \(reason); restarting in \(Int(delay)) s")
+      serverRetry = Task { [weak self] in
+        try? await Task.sleep(for: .seconds(delay))
+        guard !Task.isCancelled else { return }
+        self?.serverRetry = nil
+        self?.updateSnapshotServer()
+      }
+    case .stopped:
+      note("Core2 server stopped")
     }
   }
 
@@ -447,6 +472,7 @@ final class BridgeModel {
 
   private func appVisibilityChanged(visible: Bool) {
     inForeground.withLock { $0 = visible }
+    if visible { ensureSnapshotServer() }
     // While serving the Core2 every frame is still decoded, so there's no gap to recover from.
     if !visible && !serveToCore2 { previewDecoder.reset() }
     guard isRunning else { return }

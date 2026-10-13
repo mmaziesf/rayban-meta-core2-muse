@@ -3,9 +3,12 @@
 # host, so the Core2 needs no PC. Build from the repository root:
 #
 #   docker build -f cloud/Dockerfile -t muse-speech .
-#   docker run -p 8766:8766 -e SPEECH_TOKEN=... muse-speech
+#   docker run -p 8766:8766 -e SPEECH_TOKEN=... -e MODEL_API_KEY=... muse-speech
 #
-# The host must terminate HTTPS in front of it (see cloud/README.md).
+# MODEL_API_KEY (Meta Model API) enables /vision, which describes glasses frames.
+#
+# The host must terminate HTTPS in front of it: its managed TLS or a reverse
+# proxy such as Caddy (rayban-meta-core2-muse docs/voice.md has the details).
 FROM python:3.13-slim
 
 RUN pip install --no-cache-dir \

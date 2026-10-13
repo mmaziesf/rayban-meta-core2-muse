@@ -13,6 +13,12 @@ sending a voice note for Muse to transcribe.
 
   pc/speech_server.py [--port 8766] [--voice af_bella] [--pitch 4] [--tempo 1.05] [--loudness -9] [--flat]
   GET  /health -> "ok" (for a cloud host's health check; no token needed)
+  POST /vision image/jpeg -> a short description, text/plain (needs MODEL_API_KEY)
+
+/vision is for the glasses: Muse doesn't look at the image a gadget command
+returns, so the gadget asks for a description here (Muse Spark, Meta's Model
+API) and passes it to Muse as text. MODEL_API_KEY comes from the environment
+or the .env next to the repository (or ~/Documents/core2_projects/.env).
 
 With --token (or SPEECH_TOKEN in the environment), /stt and /tts answer only
 requests carrying "Authorization: Bearer <token>": required once the server
@@ -44,9 +50,13 @@ af_bella, bf_emma, am_michael, and the rest of Kokoro's list.
 """
 
 import argparse
+import base64
 import hmac
+import json
 import os
 import re
+import urllib.parse
+import urllib.request
 from fractions import Fraction
 import threading
 import time
@@ -62,6 +72,45 @@ from scipy import signal
 RATE = 24000          # Kokoro's output
 OUT_RATE = 16000      # what the MP3 carries (the Core2's playback rate)
 MAX_TEXT = 8192       # bytes of reply text per /tts request
+MAX_JPEG = 1 << 20    # one glasses frame per /vision request
+VISION_PROMPT = (
+    "This photo is from the user's smart glasses: what they are looking at right now. "
+    "Describe it in two or three plain sentences for someone who can't see it: the main "
+    "things, their colors, where they are, and any readable text quoted exactly. "
+    "If it's blurry or dark, still give your best guess and say what's unclear."
+)
+
+
+class Describer:
+    """Describes glasses frames with Muse Spark (OpenAI-compatible Model API)."""
+
+    def __init__(self) -> None:
+        for env in (Path(__file__).resolve().parent.parent / ".env", Path.home() / "Documents/core2_projects/.env"):
+            if env.is_file():
+                for line in env.read_text().splitlines():
+                    if "=" in line and not line.lstrip().startswith("#"):
+                        key, value = line.split("=", 1)
+                        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+                break
+        self.key = os.environ.get("MODEL_API_KEY", "")
+        self.url = os.environ.get("AGENT_BASE_URL", "https://api.meta.ai/v1").rstrip("/") + "/chat/completions"
+        self.model = os.environ.get("AGENT_MODEL", "muse-spark-1.3")
+
+    def describe(self, jpeg: bytes, question: str = "") -> str:
+        prompt = VISION_PROMPT + (f" The user asked: {question!r}" if question else "")
+        body = {
+            "model": self.model,
+            "reasoning_effort": "minimal",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}},
+            ]}],
+        }
+        request = urllib.request.Request(self.url, json.dumps(body).encode(), {
+            "Content-Type": "application/json", "Authorization": f"Bearer {self.key}"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            reply = json.load(response)
+        return (reply["choices"][0]["message"]["content"] or "").strip()
 MAX_PCM = 60 * 48000 * 2   # a minute of audio per /stt request
 
 
@@ -224,7 +273,7 @@ class Listener:
             return stripped[:1].upper() + stripped[1:] if stripped else stripped
 
 
-def make_handler(speaker: Speaker, listener: Listener, token: str):
+def make_handler(speaker: Speaker, listener: Listener, token: str, describer: Describer):
     expected = f"Bearer {token}".encode()
 
     class Handler(BaseHTTPRequestHandler):
@@ -254,6 +303,9 @@ def make_handler(speaker: Speaker, listener: Listener, token: str):
                 return
             if path == "/stt":
                 self.stt(query)
+                return
+            if path == "/vision":
+                self.vision(query)
                 return
             if path != "/tts":
                 self.send_error(404)
@@ -285,6 +337,35 @@ def make_handler(speaker: Speaker, listener: Listener, token: str):
                 return
             print(f"[tts] {self.client_address[0]}: {len(text)} chars -> {sent // 1024} KB, "
                   f"first audio {first or 0:.2f}s, total {time.monotonic() - started:.2f}s", flush=True)
+
+        def vision(self, query: str):
+            started = time.monotonic()
+            length = int(self.headers.get("Content-Length") or 0)
+            if not describer.key:
+                self.send_error(503, "no MODEL_API_KEY")
+                return
+            if not 0 < length <= MAX_JPEG:
+                self.send_error(413 if length else 400)
+                return
+            jpeg = self.rfile.read(length)
+            question = ""
+            for part in query.split("&"):
+                if part.startswith("q="):
+                    question = urllib.parse.unquote_plus(part[2:])[:300]
+            try:
+                text = describer.describe(jpeg, question)
+            except Exception as e:   # the gadget falls back to the bare image
+                print(f"[vision] failed: {e}", flush=True)
+                self.send_error(502, "vision model failed")
+                return
+            body = text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            print(f"[vision] {self.client_address[0]}: {len(jpeg) // 1024} KB -> {text[:80]!r} "
+                  f"in {time.monotonic() - started:.2f}s", flush=True)
 
         def stt(self, query: str):
             started = time.monotonic()
@@ -336,8 +417,9 @@ def main() -> None:
     speaker.warm(["Mm, let me see.", "Okay, one moment.", "Hmm, let me think.",
                   "Sure, just a sec.", "Alright, let me check.", "Ooh, good one. One sec."])
     listener = Listener(args.whisper)
-    server = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(speaker, listener, args.token))
-    print(f"[speech] {args.voice} {args.pitch:+g} st at tempo {args.speed}, {'flat' if args.flat else f'{args.loudness:g} dBFS, speaker EQ'}, whisper {args.whisper}; listening on http://0.0.0.0:{args.port} (/stt, /tts, /health), {'token required' if args.token else 'no token'}", flush=True)
+    describer = Describer()
+    server = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(speaker, listener, args.token, describer))
+    print(f"[speech] {args.voice} {args.pitch:+g} st at tempo {args.speed}, {'flat' if args.flat else f'{args.loudness:g} dBFS, speaker EQ'}, whisper {args.whisper}; listening on http://0.0.0.0:{args.port} (/stt, /tts, /vision{'' if describer.key else ' [no MODEL_API_KEY]'}, /health), {'token required' if args.token else 'no token'}", flush=True)
     server.serve_forever()
 
 

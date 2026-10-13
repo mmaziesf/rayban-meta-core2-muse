@@ -94,10 +94,11 @@ final class SnapshotServer: Sendable {
     }
     created.service = NWListener.Service(name: name, type: Self.serviceType)
     created.stateUpdateHandler = { [weak self, weak created] state in
-      guard let self else { return }
+      // A replaced listener's last updates (its cancellation) aren't news.
+      guard let self, let created, self.listener.withLockUnchecked({ $0 === created }) else { return }
       switch state {
       case .ready:
-        self.onStatus(.listening(created?.port?.rawValue ?? Self.port.rawValue))
+        self.onStatus(.listening(created.port?.rawValue ?? Self.port.rawValue))
       case .failed(let error):
         self.onStatus(.failed(error.localizedDescription))
       case .cancelled:
@@ -111,6 +112,10 @@ final class SnapshotServer: Sendable {
     }
     listener.withLockUnchecked { $0 = created }
     created.start(queue: queue)
+  }
+
+  var isListening: Bool {
+    listener.withLockUnchecked { $0?.state == .ready }
   }
 
   func stop() {

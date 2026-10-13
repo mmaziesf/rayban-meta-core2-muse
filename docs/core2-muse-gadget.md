@@ -88,6 +88,16 @@ described in [voice.md](voice.md).
   under 20 s old and only once, and otherwise fetches live.
 - **The hook.** `muse_voice_set_turn_hook()` (patch 3) lets the app act at
   the start of each turn.
+- **A description Muse can read.** Muse doesn't look at the image a command
+  returns: through this command it couldn't read a sharp test card, even
+  with the result shaped exactly like `camera.capture`'s. With
+  `CONFIG_HOMEHUB_GLASSES_DESCRIBE` (on by default with local
+  speech-to-text), each frame goes to the speech server's `/vision`, and
+  `glasses.capture` returns `payload.description` (a vision model's
+  description) next to `payload.data_base64`. The command's description tells
+  Muse to answer from it. The pre-armed fetch gets the description too, which
+  takes 3–5 s after the wake word, so a capture waits up to 8 s for a fetch
+  in flight.
 
 ## Build and flash
 

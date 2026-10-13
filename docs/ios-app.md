@@ -98,6 +98,10 @@ Device Management.
   even with the phone locked: hardware decoding isn't allowed in the
   background. The newest frame is kept as a `CIImage`, and JPEG encoding
   happens only when the Core2 asks.
+- **Self-repair.** iOS can reset the app's Bonjour connection, for example
+  around the Local Network prompt; the server then fails with
+  `DefunctConnection`. It restarts on its own after 2 s, backing off to once
+  a minute, and also when you tap Start or return to the app.
 - **The Status section** shows *Core2 server: listening on port 8765* and a
   *Core2 frames* counter with the time and address of the last request.
 

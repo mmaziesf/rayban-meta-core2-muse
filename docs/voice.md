@@ -31,12 +31,23 @@ assistant:
 |---|---|---|
 | `POST /stt?rate=16000` | raw 16-bit mono PCM | the transcript, `text/plain` |
 | `POST /tts` | reply text, `text/plain` | MP3, chunked, sentence by sentence |
+| `POST /vision?q=…` | a glasses frame, `image/jpeg` | a short description, `text/plain` |
 | `GET /health` | | `ok` (no token needed) |
 
 ```sh
 pc/speech_server.py                          # defaults: --voice af_bella --pitch 4 --tempo 1.05 --loudness -9
 SPEECH_TOKEN=... pc/speech_server.py         # require "Authorization: Bearer <token>"
 ```
+
+`/vision` exists because **Muse doesn't look at the image a gadget command
+returns**. Asked about a sharp test card ("BANANA", "42", a red circle)
+through `glasses.capture`, it said it couldn't make anything out. It does
+read text. So the Core2 sends each frame here, and Muse Spark (Meta's Model
+API, `reasoning_effort: minimal`) describes it in two or three sentences,
+quoting any readable text. That takes 2.7–5 s and needs `MODEL_API_KEY` in
+the environment or in `.env`. With it, Muse read the test card correctly and
+described a real view ("you're sitting at your desk… a microphone on a
+tripod…").
 
 Model files: `kokoro-v1.0.onnx` and `voices-v1.0.bin` from
 [kokoro-onnx's releases](https://github.com/thewh1teagle/kokoro-onnx/releases)
@@ -187,7 +198,7 @@ For a Core2 that works without a PC, run the server on a host and use HTTPS:
 
 ```sh
 docker build -f cloud/Dockerfile -t muse-speech .
-docker run -p 8766:8766 -e SPEECH_TOKEN="$(openssl rand -base64 32)" muse-speech
+docker run -p 8766:8766 -e SPEECH_TOKEN="$(openssl rand -base64 32)" -e MODEL_API_KEY=... muse-speech
 ```
 
 - **The image.** It pins the Python packages, checks the Kokoro model files'

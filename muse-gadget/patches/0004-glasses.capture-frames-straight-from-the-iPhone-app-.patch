@@ -1,6 +1,6 @@
-From ddf5d0a9d9e24d4cc4e2b6b30f365fcacddc77dc Mon Sep 17 00:00:00 2001
+From 9f7b282646f4cca17b18ae01b6db718863739ddc Mon Sep 17 00:00:00 2001
 From: Milad <mmaziesf@uwaterloo.ca>
-Date: Mon, 12 Oct 2026 21:48:57 -0700
+Date: Mon, 12 Oct 2026 23:03:15 -0700
 Subject: [PATCH 4/4] glasses.capture: frames straight from the iPhone app,
  pre-armed per turn
 
@@ -19,14 +19,25 @@ fetch, so when Muse calls glasses.capture a few seconds later the frame of
 the moment the user asked is already in memory. A capture waits up to 3 s
 for a fetch in flight, uses a frame under 20 s old once, and otherwise
 fetches live.
+
+Muse doesn't look at the image a command returns (asked about a sharp
+test card through this command, it said it couldn't make anything out),
+but it reads text. HOMEHUB_GLASSES_DESCRIBE (default on with
+MUSE_LOCAL_STT) posts each frame to the speech server's /vision, which
+describes it with a vision model, and returns that in
+payload.description next to the JPEG; the command description tells
+Muse to answer from it. The pre-armed fetch gets the description too, so
+a capture waits up to 8 s for one in flight. The result otherwise has
+camera.capture's shape (format, data_base64).
 ---
  esp32/main/CMakeLists.txt    |   7 +
- esp32/main/Kconfig.projbuild |  14 +-
- esp32/main/app.c             |   3 +
- esp32/main/glasses_capture.c | 267 ++++++++++++++++++++++++++++++++++-
- esp32/main/glasses_capture.h |  20 ++-
+ esp32/main/Kconfig.projbuild |  27 ++-
+ esp32/main/app.c             |  11 +-
+ esp32/main/glasses_capture.c | 353 ++++++++++++++++++++++++++++++++++-
+ esp32/main/glasses_capture.h |  23 ++-
  esp32/main/idf_component.yml |   4 +
- 6 files changed, 305 insertions(+), 10 deletions(-)
+ esp32/main/noise_control.cpp |   5 +-
+ 7 files changed, 414 insertions(+), 16 deletions(-)
 
 diff --git a/esp32/main/CMakeLists.txt b/esp32/main/CMakeLists.txt
 index a4df3ba..667f286 100644
@@ -44,10 +55,10 @@ index a4df3ba..667f286 100644
 +    target_link_libraries(${COMPONENT_LIB} PRIVATE ${mdns_lib})
 +endif()
 diff --git a/esp32/main/Kconfig.projbuild b/esp32/main/Kconfig.projbuild
-index 837a298..34c4e74 100644
+index 837a298..a9e3ccc 100644
 --- a/esp32/main/Kconfig.projbuild
 +++ b/esp32/main/Kconfig.projbuild
-@@ -333,7 +333,19 @@ menu "ESP32 Device SDK"
+@@ -333,7 +333,32 @@ menu "ESP32 Device SDK"
              HTTP URL that returns the latest glasses frame as one JPEG, or
              503 while the glasses are not streaming. Set it per device to the
              relay computer's address (idf.py menuconfig, or the build
@@ -55,6 +66,19 @@ index 837a298..34c4e74 100644
 +            directory's sdkconfig), as with the SDK token. With
 +            HOMEHUB_GLASSES_DISCOVER it is the fallback for when no phone is
 +            found; leave it empty to use the phone only.
++
++    config HOMEHUB_GLASSES_DESCRIBE
++        bool "Describe glasses frames with the speech server's vision model"
++        depends on HOMEHUB_GLASSES_CAPTURE && MUSE_LOCAL_STT
++        default y
++        help
++            Muse doesn't look at the image a gadget command returns, but it
++            reads text. With this on, each frame is POSTed to the speech
++            server's /vision (next to MUSE_STT_URL), which describes it with
++            a vision model, and glasses.capture returns that description in
++            payload.description along with the image. The pre-armed fetch at
++            the start of a turn gets the description too, so it's usually
++            ready when Muse asks.
 +
 +    config HOMEHUB_GLASSES_DISCOVER
 +        bool "Find the Glasses Bridge iPhone app on the network (mDNS)"
@@ -69,10 +93,36 @@ index 837a298..34c4e74 100644
      config HOMEHUB_DISPLAY_COMMANDS
          bool
 diff --git a/esp32/main/app.c b/esp32/main/app.c
-index c23a323..c3a8469 100644
+index c23a323..17eef3f 100644
 --- a/esp32/main/app.c
 +++ b/esp32/main/app.c
-@@ -2693,6 +2693,9 @@ void app_run(void) {
+@@ -1574,12 +1574,15 @@ static void glasses_capture_task(void *arg) {
+     char *image = NULL;
+     const char *error = NULL;
+     cJSON *result = cJSON_CreateObject();
+-    bool ok = glasses_capture(&image, &error);
++    char *description = NULL;
++    bool ok = glasses_capture(&image, &description, &error);
+     cJSON_AddBoolToObject(result, "ok", ok);
+     if (ok) {
+         cJSON *payload = cJSON_AddObjectToObject(result, "payload");
++        if (description) {
++            cJSON_AddStringToObject(payload, "description", description);
++        }
+         cJSON_AddStringToObject(payload, "format", "jpeg-base64");
+-        cJSON_AddStringToObject(payload, "source", "meta-ray-ban-glasses");
+         cJSON_AddStringToObject(payload, "data_base64", image);
+     } else {
+         cJSON *failure = cJSON_AddObjectToObject(result, "error");
+@@ -1587,6 +1590,7 @@ static void glasses_capture_task(void *arg) {
+         cJSON_AddStringToObject(failure, "message", error ? error : "glasses capture failed");
+     }
+     free(image);
++    free(description);
+     noise_ctrl_send_command_result(args->session_generation, args->request_id, result);
+     free(args);
+     stack_monitor_record(NULL);
+@@ -2693,6 +2697,9 @@ void app_run(void) {
  #if CONFIG_HOMEHUB_RETERMINAL_SHT4X
      reterminal_sht4x_init();
  #endif
@@ -83,10 +133,10 @@ index c23a323..c3a8469 100644
      if (!setup_complete) {
          // Unpaired devices advertise automatically — no button press is needed
 diff --git a/esp32/main/glasses_capture.c b/esp32/main/glasses_capture.c
-index d83591f..b6527ea 100644
+index d83591f..99baa32 100644
 --- a/esp32/main/glasses_capture.c
 +++ b/esp32/main/glasses_capture.c
-@@ -18,11 +18,28 @@
+@@ -18,11 +18,31 @@
  #include <stdint.h>
  #include <stdlib.h>
  
@@ -112,10 +162,13 @@ index d83591f..b6527ea 100644
 +#if CONFIG_HOMEHUB_GLASSES_DISCOVER
 +#include "mdns.h"
 +#endif
++#if CONFIG_HOMEHUB_GLASSES_DESCRIBE
++#include "muse_speech_http.h"
++#endif
  
  static const char *TAG = "link.glasses";
  
-@@ -36,11 +53,13 @@ static void *psram_alloc(size_t len)
+@@ -36,11 +56,13 @@ static void *psram_alloc(size_t len)
      return p ? p : malloc(len);
  }
  
@@ -132,7 +185,7 @@ index d83591f..b6527ea 100644
          .timeout_ms = 8000,
          .buffer_size = 4096,
      };
-@@ -55,6 +74,7 @@ static uint8_t *fetch(size_t *len, const char **error)
+@@ -55,6 +77,7 @@ static uint8_t *fetch(size_t *len, const char **error)
      int status = 0;
      if (esp_http_client_open(client, 0) != ESP_OK) {
          *error = "glasses relay is not reachable on the home network";
@@ -140,10 +193,11 @@ index d83591f..b6527ea 100644
          goto done;
      }
      content_length = esp_http_client_fetch_headers(client);
-@@ -94,12 +114,249 @@ done:
+@@ -94,12 +117,327 @@ done:
      return body;
  }
  
+-bool glasses_capture(char **jpeg_base64, const char **error)
 +#if CONFIG_HOMEHUB_GLASSES_DISCOVER
 +#define PHONE_SERVICE "_glasses-bridge"
 +
@@ -272,6 +326,72 @@ index d83591f..b6527ea 100644
 +    return jpeg;
 +}
 +
++#if CONFIG_HOMEHUB_GLASSES_DESCRIBE
++/*
++ * A description of the frame from the speech server's /vision (a vision
++ * model): Muse doesn't look at the image a command returns, but it reads
++ * text. Returns a heap string, or NULL if the server couldn't describe it.
++ */
++#define DESCRIPTION_MAX 1024
++static char s_desc_buf[DESCRIPTION_MAX];
++static int s_desc_len;
++
++static esp_err_t on_description(esp_http_client_event_t *e)
++{
++    if (e->event_id == HTTP_EVENT_ON_DATA && e->data_len > 0) {
++        int n = e->data_len < DESCRIPTION_MAX - 1 - s_desc_len ? e->data_len : DESCRIPTION_MAX - 1 - s_desc_len;
++        memcpy(s_desc_buf + s_desc_len, e->data, n);
++        s_desc_len += n;
++    }
++    return ESP_OK;
++}
++
++static char *describe(const uint8_t *jpeg, size_t len)
++{
++    static SemaphoreHandle_t lock;   /* the buffer above is shared: one request at a time */
++    if (!lock && !(lock = xSemaphoreCreateMutex())) {
++        return NULL;
++    }
++    /* The speech server's address, with /vision for /stt. */
++    char url[sizeof(CONFIG_MUSE_STT_URL) + 8];
++    strlcpy(url, CONFIG_MUSE_STT_URL, sizeof(url));
++    char *slash = strrchr(url, '/');
++    if (!slash || slash < strstr(url, "://") + 3) {
++        return NULL;
++    }
++    strcpy(slash, "/vision");
++    xSemaphoreTake(lock, portMAX_DELAY);
++    int64_t t0 = esp_timer_get_time();
++    char *text = NULL;
++    s_desc_len = 0;
++    esp_http_client_handle_t client = muse_speech_client(url, 20000, on_description);
++    if (client) {
++        esp_http_client_set_method(client, HTTP_METHOD_POST);
++        esp_http_client_set_header(client, "Content-Type", "image/jpeg");
++        esp_http_client_set_post_field(client, (const char *)jpeg, (int)len);
++        esp_err_t err = esp_http_client_perform(client);
++        int status = esp_http_client_get_status_code(client);
++        if (err == ESP_OK && status == 200 && s_desc_len > 0) {
++            s_desc_buf[s_desc_len] = '\0';
++            text = strdup(s_desc_buf);
++            ESP_LOGI(TAG, "described in %d ms: %.60s...", (int)((esp_timer_get_time() - t0) / 1000), s_desc_buf);
++        } else {
++            ESP_LOGW(TAG, "no description (%s, HTTP %d)", esp_err_to_name(err), status);
++        }
++        esp_http_client_cleanup(client);
++    }
++    xSemaphoreGive(lock);
++    return text;
++}
++#else
++static char *describe(const uint8_t *jpeg, size_t len)
++{
++    (void)jpeg;
++    (void)len;
++    return NULL;
++}
++#endif
++
 +/*
 + * Pre-armed capture. Each turn (wake word, tap or follow-up) starts a fetch in
 + * the background, so the frame of the moment the user spoke is already here
@@ -279,12 +399,13 @@ index d83591f..b6527ea 100644
 + * looked up at boot rather than on the first question.
 + */
 +#define PREFETCH_MAX_AGE_US (20 * 1000000LL)   /* a turn's frame: speech + thinking */
-+#define PREFETCH_WAIT_MS 3000                  /* a capture waits this long for one in flight */
++#define PREFETCH_WAIT_MS 8000                  /* a capture waits this long for one in flight (frame + description) */
 +
 +static SemaphoreHandle_t s_lock;               /* guards the cached frame */
 +static TaskHandle_t s_task;
 +static uint8_t *s_cached;
 +static size_t s_cached_len;
++static char *s_cached_desc;                    /* its description, or NULL */
 +static int64_t s_cached_at;
 +static volatile unsigned s_wanted, s_done;  /* prefetches asked for / finished */
 +
@@ -310,17 +431,21 @@ index d83591f..b6527ea 100644
 +        size_t len = 0;
 +        const char *error = NULL;
 +        uint8_t *jpeg = fetch_frame(&len, &error);
++        char *desc = jpeg ? describe(jpeg, len) : NULL;
 +        xSemaphoreTake(s_lock, portMAX_DELAY);
 +        if (jpeg) {
 +            free(s_cached);
++            free(s_cached_desc);
 +            s_cached = jpeg;
 +            s_cached_len = len;
++            s_cached_desc = desc;
 +            s_cached_at = t0;
 +        }
 +        s_done = wanted;
 +        xSemaphoreGive(s_lock);
 +        if (jpeg) {
-+            ESP_LOGI(TAG, "pre-armed %u-byte frame in %d ms", (unsigned)len, (int)((esp_timer_get_time() - t0) / 1000));
++            ESP_LOGI(TAG, "pre-armed %u-byte frame%s in %d ms", (unsigned)len, desc ? " and description" : "",
++                     (int)((esp_timer_get_time() - t0) / 1000));
 +        } else {
 +            ESP_LOGI(TAG, "no frame to pre-arm: %s", error);
 +        }
@@ -358,8 +483,9 @@ index d83591f..b6527ea 100644
 +}
 +
 +/* The pre-armed frame if there is a fresh one (waiting briefly for one in flight). */
-+static uint8_t *take_prefetched(size_t *len)
++static uint8_t *take_prefetched(size_t *len, char **desc)
 +{
++    *desc = NULL;
 +    if (!s_task) {
 +        return NULL;
 +    }
@@ -371,40 +497,54 @@ index d83591f..b6527ea 100644
 +    if (s_cached && esp_timer_get_time() - s_cached_at <= PREFETCH_MAX_AGE_US) {
 +        jpeg = s_cached;   /* used once: a second capture in the turn fetches anew */
 +        *len = s_cached_len;
++        *desc = s_cached_desc;
 +        s_cached = NULL;
++        s_cached_desc = NULL;
 +    }
 +    xSemaphoreGive(s_lock);
 +    return jpeg;
 +}
 +
- bool glasses_capture(char **jpeg_base64, const char **error)
++bool glasses_capture(char **jpeg_base64, char **description, const char **error)
  {
      *jpeg_base64 = NULL;
++    *description = NULL;
      *error = NULL;
      size_t len = 0;
 -    uint8_t *jpeg = fetch(&len, error);
-+    uint8_t *jpeg = take_prefetched(&len);
++    uint8_t *jpeg = take_prefetched(&len, description);
 +    bool prearmed = jpeg != NULL;
 +    if (!jpeg) {
 +        jpeg = fetch_frame(&len, error);
++        if (jpeg) {
++            *description = describe(jpeg, len);
++        }
 +    }
      if (!jpeg) {
          ESP_LOGW(TAG, "capture failed: %s", *error);
          return false;
-@@ -116,7 +373,7 @@ bool glasses_capture(char **jpeg_base64, const char **error)
+@@ -111,12 +449,15 @@ bool glasses_capture(char **jpeg_base64, const char **error)
+     if (!out || mbedtls_base64_encode((unsigned char *)out, need + 1, &olen, jpeg, len) != 0) {
+         free(out);
+         free(jpeg);
++        free(*description);
++        *description = NULL;
+         *error = "out of memory encoding the glasses frame";
+         return false;
      }
      out[olen] = '\0';
      free(jpeg);
 -    ESP_LOGI(TAG, "captured %u-byte frame", (unsigned)len);
-+    ESP_LOGI(TAG, "captured %u-byte frame (%s)", (unsigned)len, prearmed ? "pre-armed" : "fetched now");
++    ESP_LOGI(TAG, "captured %u-byte frame (%s)%s", (unsigned)len, prearmed ? "pre-armed" : "fetched now",
++             *description ? " with a description" : "");
      *jpeg_base64 = out;
      return true;
  }
 diff --git a/esp32/main/glasses_capture.h b/esp32/main/glasses_capture.h
-index 0b05bd7..649de10 100644
+index 0b05bd7..1e7ce5c 100644
 --- a/esp32/main/glasses_capture.h
 +++ b/esp32/main/glasses_capture.h
-@@ -18,9 +18,21 @@
+@@ -18,9 +18,22 @@
  #include <stdbool.h>
  
  /*
@@ -416,10 +556,12 @@ index 0b05bd7..649de10 100644
 + * command: from the Glasses Bridge iPhone app found over mDNS
 + * (CONFIG_HOMEHUB_GLASSES_DISCOVER), else from a relay on the home network
 + * (CONFIG_HOMEHUB_GLASSES_CAPTURE_URL); either is an HTTP GET returning one
-+ * JPEG. On success *jpeg_base64 is a heap string the caller frees; on failure
-+ * *error is a static message.
++ * JPEG. On success *jpeg_base64 is a heap string the caller frees, and
++ * *description (CONFIG_HOMEHUB_GLASSES_DESCRIBE) a heap string describing the
++ * frame, or NULL; on failure *error is a static message.
   */
- bool glasses_capture(char **jpeg_base64, const char **error);
+-bool glasses_capture(char **jpeg_base64, const char **error);
++bool glasses_capture(char **jpeg_base64, char **description, const char **error);
 +
 +/*
 + * Pre-arms capture: finds the phone as soon as Wi-Fi is up and, at the start
@@ -444,6 +586,22 @@ index c761d20..54810d1 100644
 +      - if: "$CONFIG{HOMEHUB_GLASSES_DISCOVER} == True"
    idf:
      version: ">=5.1"
+diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
+index 6d6a3cc..c23615a 100644
+--- a/esp32/main/noise_control.cpp
++++ b/esp32/main/noise_control.cpp
+@@ -1411,8 +1411,9 @@ static char *build_register_json(void) {
+                 "Capture the latest frame from the user's Meta Ray-Ban glasses "
+                 "camera: what the user is looking at right now. Use it when the "
+                 "user asks about what they see, are looking at, reading, holding "
+-                "or eating. Returns one JPEG as base64; fails if the glasses are "
+-                "not streaming.",
++                "or eating. Returns payload.description, a description of the "
++                "frame by a vision model (answer from it), and the JPEG as "
++                "base64; fails if the glasses are not streaming.",
+                 nullptr, nullptr);
+     cJSON_AddNumberToObject(
+         cJSON_GetObjectItem(commands, "glasses.capture"), "timeout_ms", 15000);
 -- 
 2.53.0
 
